@@ -349,6 +349,271 @@ async def provision_langchain_model(
     # ... 验证和返回
 ```
 
+### 3.6 流式响应的实际实现路径
+
+系统中存在三种不同的对话场景，每种采用不同的流式策略：
+
+#### 3.6.1 Source Chat 的"伪流式"实现
+
+`api/routers/source_chat.py` 实现了 SSE 格式的流式响应，但内部实际是同步调用：
+
+```python
+# api/routers/source_chat.py:417-480
+async def stream_source_chat_response(
+    session_id: str, source_id: str, message: str, model_override: Optional[str] = None
+) -> AsyncGenerator[str, None]:
+    # ... 准备状态
+    
+    # 关键点：使用同步 invoke，而非真正的 astream
+    result = source_chat_graph.invoke(
+        input=state_values,
+        config=RunnableConfig(
+            configurable={"thread_id": session_id, "model_id": model_override}
+        ),
+    )
+    
+    # 获得完整结果后，一次性发送 AI 消息
+    if "messages" in result:
+        for msg in result["messages"]:
+            if hasattr(msg, "type") and msg.type == "ai":
+                ai_event = {
+                    "type": "ai_message",
+                    "content": msg.content,
+                    "timestamp": None,
+                }
+                yield f"data: {json.dumps(ai_event)}\n\n"
+    
+    # 然后发送 context_indicators 和 complete 信号
+```
+
+路由层返回 `StreamingResponse`：
+
+```python
+# api/routers/source_chat.py:535-548
+return StreamingResponse(
+    stream_source_chat_response(
+        session_id=full_session_id,
+        source_id=full_source_id,
+        message=request.message,
+        model_override=model_override,
+    ),
+    media_type="text/plain",
+    headers={
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Content-Type": "text/plain; charset=utf-8",
+    },
+)
+```
+
+**事件类型**：
+1. `user_message`: 用户消息确认
+2. `ai_message`: 完整的 AI 响应（一次性发送）
+3. `context_indicators`: 上下文引用信息
+4. `complete`: 完成信号
+
+**特点**：外部表现为 SSE 流式，内部实际是同步阻塞调用 `invoke()`。AI 响应内容是一次性完整发送，而非逐 token。
+
+#### 3.6.2 Ask 功能的真正流式实现
+
+`api/routers/search.py` 中的 Ask 功能使用了真正的 LangGraph 节点级流式更新：
+
+```python
+# api/routers/search.py:61-110
+async def stream_ask_response(
+    question: str, strategy_model: Model, answer_model: Model, final_answer_model: Model
+) -> AsyncGenerator[str, None]:
+    final_answer = None
+    
+    # 关键点：使用 astream，stream_mode="updates"
+    async for chunk in ask_graph.astream(
+        input=dict(question=question),
+        config=dict(
+            configurable=dict(
+                strategy_model=strategy_model.id,
+                answer_model=answer_model.id,
+                final_answer_model=final_answer_model.id,
+            )
+        ),
+        stream_mode="updates",  # 节点级别的更新流
+    ):
+        if "agent" in chunk:
+            # 策略节点输出：搜索计划
+            strategy_data = {
+                "type": "strategy",
+                "reasoning": chunk["agent"]["strategy"].reasoning,
+                "searches": [
+                    {"term": search.term, "instructions": search.instructions}
+                    for search in chunk["agent"]["strategy"].searches
+                ],
+            }
+            yield f"data: {json.dumps(strategy_data)}\n\n"
+        
+        elif "provide_answer" in chunk:
+            # 回答节点输出：每个搜索的结果
+            for answer in chunk["provide_answer"]["answers"]:
+                answer_data = {"type": "answer", "content": answer}
+                yield f"data: {json.dumps(answer_data)}\n\n"
+        
+        elif "write_final_answer" in chunk:
+            # 最终答案节点
+            final_answer = chunk["write_final_answer"]["final_answer"]
+            final_data = {"type": "final_answer", "content": final_answer}
+            yield f"data: {json.dumps(final_data)}\n\n"
+```
+
+**Ask 图的结构**：
+
+```python
+# open_notebook/graphs/ask.py:146-154
+agent_state = StateGraph(ThreadState)
+agent_state.add_node("agent", call_model_with_messages)
+agent_state.add_node("provide_answer", provide_answer)
+agent_state.add_node("write_final_answer", write_final_answer)
+agent_state.add_edge(START, "agent")
+agent_state.add_conditional_edges("agent", trigger_queries, ["provide_answer"])
+agent_state.add_edge("provide_answer", "write_final_answer")
+agent_state.add_edge("write_final_answer", END)
+```
+
+**流式事件类型**：
+1. `strategy`: 搜索策略（推理 + 搜索词列表）
+2. `answer`: 每个搜索的回答（可并行多个）
+3. `final_answer`: 综合最终答案
+4. `complete`: 完成信号
+
+#### 3.6.3 Notebook Chat 的非流式实现
+
+`api/routers/chat.py` 中的 Notebook Chat 完全是非流式的：
+
+```python
+# api/routers/chat.py:372-380
+# Execute chat graph - 同步调用
+result = chat_graph.invoke(
+    input=state_values,
+    config=RunnableConfig(
+        configurable={
+            "thread_id": full_session_id,
+            "model_id": model_override,
+        }
+    ),
+)
+```
+
+**三种对话场景的流式策略对比**：
+
+| 场景 | 文件 | 流式方式 | 实现特点 |
+|------|------|----------|----------|
+| Source Chat | `api/routers/source_chat.py` | 伪流式 | SSE 包装同步 invoke，AI 消息一次性发送 |
+| Ask | `api/routers/search.py` | 真正流式 | LangGraph `astream()` + `stream_mode="updates"`，节点级更新 |
+| Notebook Chat | `api/routers/chat.py` | 非流式 | 纯同步 `invoke()`，完整响应 |
+
+### 3.7 工具调用的实际实现状态
+
+#### 3.7.1 工具定义
+
+`open_notebook/graphs/tools.py` 中只定义了一个工具：
+
+```python
+# open_notebook/graphs/tools.py:1-13
+from datetime import datetime
+from langchain.tools import tool
+
+@tool
+def get_current_timestamp() -> str:
+    """
+    name: get_current_timestamp
+    Returns the current timestamp in the format YYYYMMDDHHmmss.
+    """
+    return datetime.now().strftime("%Y%m%d%H%M%S")
+```
+
+#### 3.7.2 工具绑定状态：**实际未启用**
+
+关键发现：**`bind_tools` 被注释掉了，项目实际上并未使用原生工具调用！**
+
+```python
+# open_notebook/graphs/ask.py:51-80
+async def call_model_with_messages(state: ThreadState, config: RunnableConfig) -> dict:
+    try:
+        parser = PydanticOutputParser(pydantic_object=Strategy)
+        system_prompt = Prompter(prompt_template="ask/entry", parser=parser).render(
+            data=state
+        )
+        model = await provision_langchain_model(
+            system_prompt,
+            config.get("configurable", {}).get("strategy_model"),
+            "tools",  # 注意：使用 "tools" 类型标记
+            max_tokens=2000,
+            structured=dict(type="json"),  # 关键点：使用结构化输出
+        )
+        # model = model.bind_tools(tools)  # ← 被注释掉了！
+        
+        # 使用结构化 JSON 输出，而非工具调用
+        ai_message = await model.ainvoke(system_prompt)
+        
+        # 手动解析 JSON
+        message_content = extract_text_content(ai_message.content)
+        cleaned_content = clean_thinking_content(message_content)
+        strategy = parser.parse(cleaned_content)  # 手动解析
+        
+        return {"strategy": strategy}
+```
+
+#### 3.7.3 "Tools Model" 的实际含义
+
+系统中有 `default_tools_model` 配置，但这**不是指支持工具调用的模型**，而是指：
+
+```python
+# open_notebook/ai/models.py:238-239
+elif model_type == "tools":
+    model_id = defaults.default_tools_model or defaults.default_chat_model
+```
+
+在 `ask.py` 中使用 `"tools"` 类型时，实际上是用于**结构化输出场景**的模型选择标记。
+
+#### 3.7.4 结构化输出 vs 工具调用
+
+项目当前使用的是**结构化 JSON 输出**（LangChain `structured` 参数 + `PydanticOutputParser`），而非**原生工具调用**（`bind_tools`）。
+
+**两种方式的区别**：
+
+| 特性 | 结构化 JSON 输出 | 原生工具调用 (bind_tools) |
+|------|------------------|---------------------------|
+| 实现方式 | `structured=dict(type="json")` + Prompt 指导 | `model.bind_tools(tools)` |
+| 模型依赖 | 依赖模型遵循 JSON 格式指令 | 依赖模型原生支持 function calling |
+| 输出解析 | 手动 `parser.parse()` | 框架自动解析 tool_calls |
+| 多轮交互 | 需要手动实现 | LangGraph 内置 tool_executor 模式 |
+| 当前状态 | ✅ 实际使用 | ❌ 代码注释掉了 |
+
+#### 3.7.5 触发条件
+
+由于工具调用未实际启用，系统的"工具调用"实际上是：
+
+1. **通过 Prompt 引导模型输出 JSON**：使用 `PydanticOutputParser` 生成格式指令注入 Prompt
+2. **模型类型选择**：当需要结构化输出时，选择 `default_tools_model`（如果配置），否则回退到 `default_chat_model`
+3. **输出解析**：通过 `parser.parse(cleaned_content)` 将 JSON 文本转为 Pydantic 对象
+
+**Strategy Pydantic 模型**（结构化输出的目标格式）：
+
+```python
+# open_notebook/graphs/ask.py:29-41
+class Search(BaseModel):
+    term: str
+    instructions: str = Field(
+        description="Tell the answering LLM what information you need extracted from this search"
+    )
+
+class Strategy(BaseModel):
+    reasoning: str
+    searches: List[Search] = Field(
+        default_factory=list,
+        description="You can add up to five searches to this strategy",
+    )
+```
+
+这是一个典型的**规划-执行**模式，通过结构化输出让模型生成搜索计划，而非真正调用外部工具。
+
 ---
 
 ## 4. 异常处理与分流策略
