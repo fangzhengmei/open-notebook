@@ -287,35 +287,43 @@ def call_model_with_messages(state: ThreadState, config: RunnableConfig) -> dict
 
 ### 3.3 流式响应的统一处理
 
-虽然当前实现使用同步 `invoke()`，但 LangChain 的 `BaseChatModel` 提供了统一的流式接口：
+LangChain 的 `BaseChatModel` 定义了统一的流式接口 `astream()`，可以将不同提供商的流式协议（SSE、WebSocket、自定义分块格式）差异在底层由 Esperanto 库统一处理。
+
+然而，项目的实际实现存在**两种不同的流式策略**，详见 **3.6 节 流式响应的实际实现路径**。
+
+### 3.4 工具调用：架构预留但未实际启用
+
+LangChain 的 `BaseChatModel` 定义了标准的工具调用接口 `bind_tools()`，项目也预留了 `default_tools_model` 配置，并有一个示例工具定义：
 
 ```python
-# 示例：LangChain 的流式调用模式
-async for chunk in model.astream(payload):
-    yield chunk.content
-```
-
-不同提供商的流式协议差异（如 SSE、WebSocket、自定义分块格式）由 Esperanto 库在底层统一处理，上层只需调用 `astream()` 即可获得一致的异步生成器。
-
-### 3.4 工具调用的统一接口
-
-LangChain 的 `BaseChatModel` 定义了标准的工具调用接口：
-
-```python
-# LangChain 工具调用模式
-from langchain_core.tools import tool
+# open_notebook/graphs/tools.py:1-13
+from datetime import datetime
+from langchain.tools import tool
 
 @tool
 def get_current_timestamp() -> str:
-    """Returns the current timestamp."""
+    """
+    name: get_current_timestamp
+    Returns the current timestamp in the format YYYYMMDDHHmmss.
+    """
     return datetime.now().strftime("%Y%m%d%H%M%S")
-
-# 绑定工具到模型
-model_with_tools = model.bind_tools([get_current_timestamp])
-
-# 调用时模型可选择调用工具
-response = model_with_tools.invoke(messages)
 ```
+
+**但关键发现**：这个工具调用机制**实际上被注释掉了，从未生效**：
+
+```python
+# open_notebook/graphs/ask.py:51-64
+model = await provision_langchain_model(
+    system_prompt,
+    config.get("configurable", {}).get("strategy_model"),
+    "tools",  # 注意：这里只是类型标记，不是真正的工具调用
+    max_tokens=2000,
+    structured=dict(type="json"),  # 关键点：使用结构化输出
+)
+# model = model.bind_tools(tools)  # ← 被注释掉了！
+```
+
+项目实际采用的是**结构化 JSON 输出**替代原生工具调用。详见 **3.7 节 工具调用的实际实现状态**。
 
 ### 3.5 模型选择的智能策略
 
