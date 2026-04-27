@@ -1185,31 +1185,68 @@ DEFINE FUNCTION IF NOT EXISTS fn::hybrid_search_with_graph(
     }
     
     -- ========== 步骤 3: 对扩展结果执行关键词匹配（验证） ==========
-    LET $expanded_results = SELECT 
+    -- 注意：SurrealDB 不支持 UNION ALL，使用多个 SELECT + array::union()
+    -- 参考现有 fn::text_search 的实现风格
+    
+    -- 查询 source 标题匹配
+    LET $expanded_source_title = SELECT 
         id,
-        parent_id,
+        id as parent_id,
         title,
+        search::highlight('`', '`', 1) as content,
         search::score(1) * $decay_factor as relevance,
         "expanded" as _source_type,
         1 as _hop_count
-    FROM (
-        SELECT id, id as parent_id, title FROM source 
-        WHERE id IN $all_expanded AND title @1@ $query_text
-        
-        UNION ALL
-        
-        SELECT source.id as id, source.id as parent_id, source.title as title 
-        FROM source_embedding 
-        WHERE source IN $all_expanded AND content @1@ $query_text
-        
-        UNION ALL
-        
-        SELECT id, id as parent_id, title FROM note 
-        WHERE id IN $all_expanded AND (title @1@ $query_text OR content @1@ $query_text)
-    )
-    GROUP BY id, parent_id, title
-    ORDER BY relevance DESC
-    LIMIT $match_count;
+    FROM source 
+    WHERE id IN $all_expanded AND title @1@ $query_text
+    GROUP BY id;
+    
+    -- 查询 source_embedding 内容匹配
+    LET $expanded_source_embedding = SELECT 
+        source.id as id,
+        source.id as parent_id,
+        source.title as title,
+        search::highlight('`', '`', 1) as content,
+        search::score(1) * $decay_factor as relevance,
+        "expanded" as _source_type,
+        1 as _hop_count
+    FROM source_embedding 
+    WHERE source IN $all_expanded AND content @1@ $query_text
+    GROUP BY id;
+    
+    -- 查询 note 标题/内容匹配
+    LET $expanded_note = SELECT 
+        id,
+        id as parent_id,
+        title,
+        search::highlight('`', '`', 1) as content,
+        search::score(1) * $decay_factor as relevance,
+        "expanded" as _source_type,
+        1 as _hop_count
+    FROM note 
+    WHERE id IN $all_expanded AND (title @1@ $query_text OR content @1@ $query_text)
+    GROUP BY id;
+    
+    -- 合并结果（参考 fn::text_search 的合并方式）
+    LET $expanded_source_results = array::union($expanded_source_title, $expanded_source_embedding);
+    LET $expanded_results = array::union($expanded_source_results, $expanded_note);
+    
+    -- 去重排序
+    LET $expanded_results = (
+        SELECT 
+            id, 
+            parent_id, 
+            title, 
+            content,
+            math::max(relevance) as relevance,
+            array::first(_source_type) as _source_type,
+            math::min(_hop_count) as _hop_count
+        FROM $expanded_results
+        WHERE id IS NOT NONE
+        GROUP BY id, parent_id, title
+        ORDER BY relevance DESC
+        LIMIT $match_count
+    );
     
     -- ========== 步骤 4: 合并并去重 ==========
     LET $all_results = array::union($base_with_meta, $expanded_results);
