@@ -8,30 +8,70 @@ Open-Notebook 使用 SurrealDB 实现了一个结合向量检索、全文检索�
 
 ## 2. 整体架构
 
-### 2.1 模块层级
+### 2.1 服务端搜索链路（核心）
+
+服务端搜索请求不经过 `api/search_service.py`，路由层直接调用业务域层：
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        API Layer                                  │
+│                   API Router Layer                                │
 │  api/routers/search.py (FastAPI 端点)                            │
-│  api/search_service.py (服务层封装)                               │
+│  - POST /search                                                   │
+│  - POST /search/ask                                               │
+│  - POST /search/ask/simple                                        │
 ├─────────────────────────────────────────────────────────────────┤
 │                      Domain Layer                                 │
 │  open_notebook/domain/notebook.py (核心业务逻辑)                  │
-│  - text_search() 函数                                             │
-│  - vector_search() 函数                                           │
+│  - text_search() 函数: 调用 fn::text_search()                    │
+│  - vector_search() 函数: 生成查询向量 + 调用 fn::vector_search() │
 ├─────────────────────────────────────────────────────────────────┤
 │                      Database Layer                               │
 │  open_notebook/database/repository.py (数据库操作)                │
+│  - repo_query(): 执行 SurrealQL 查询                              │
+│  - db_connection(): 数据库连接管理                                │
+│                                                         │
 │  open_notebook/database/migrations/*.surrealql (SurrealQL 函数) │
-│  - fn::text_search()                                              │
-│  - fn::vector_search()                                            │
+│  - fn::text_search(): 全文检索 + 合并去重排序                     │
+│  - fn::vector_search(): 向量检索 + 合并去重排序                   │
 ├─────────────────────────────────────────────────────────────────┤
 │                      Embedding Layer                              │
 │  commands/embedding_commands.py (异步嵌入命令)                    │
+│  - embed_source_command: Source 分块嵌入                          │
+│  - embed_note_command: Note 嵌入                                  │
+│  - embed_insight_command: Insight 嵌入                            │
+│                                                         │
 │  open_notebook/utils/embedding.py (嵌入生成逻辑)                  │
+│  - generate_embedding(): 单个文本嵌入（自动分块+平均池化）         │
+│  - generate_embeddings(): 批量嵌入                                │
+│  - mean_pool_embeddings(): 平均池化                               │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+### 2.2 客户端组件（不参与服务端搜索链路）
+
+以下组件是**客户端封装**，用于外部调用后端 API，**不参与服务端的搜索执行链路**：
+
+| 组件 | 路径 | 定位 | 使用者 |
+|-----|------|------|--------|
+| `APIClient` | `api/client.py` | HTTP 客户端封装，基于 `httpx` | 命令行工具、外部脚本 |
+| `SearchService` | `api/search_service.py` | 对 `APIClient` 的搜索相关封装 | 命令行工具、外部脚本 |
+| `searchApi` | `frontend/src/lib/api/search.ts` | 前端 API 调用封装 | Next.js 前端应用 |
+
+**客户端调用链路示例**：
+```
+前端/命令行工具
+    ↓
+api/search_service.py → api/client.py (httpx)
+    ↓
+HTTP POST /api/search
+    ↓
+进入服务端搜索链路（见上图）
+```
+
+**关键修正说明**：
+- 原报告误将 `api/search_service.py` 标注为服务层组件，但实际上它是**客户端封装**
+- 服务端的真实入口是 `api/routers/search.py`，直接调用 `open_notebook/domain/notebook.py`
+- 前端通过 `frontend/src/lib/api/search.ts` 直接调用 `/api/search` 端点，不经过 `api/search_service.py`
 
 ---
 
