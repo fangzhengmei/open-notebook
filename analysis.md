@@ -538,6 +538,649 @@ async def delete(self, delete_exclusive_sources: bool = False) -> Dict[str, int]
 SELECT ->reference->notebook<-reference<-source FROM source:xxx
 ```
 
+#### 3.4.4 设计权衡：为什么当前方案不做图遍历扩展
+
+当前搜索实现选择**不使用图遍历扩展搜索结果**，这是一个经过多维度权衡的设计决策。以下从三个核心维度分析：
+
+##### 3.4.4.1 查询性能考量
+
+| 考量点 | 具体分析 |
+|-------|---------|
+| **多跳查询复杂度** | 图遍历（如 `->reference->notebook<-reference<-source`）需要至少 3 跳：Source → 关系表 → Notebook → 关系表 → 其他 Source。每一跳都涉及一次表查询或索引查找。 |
+| **结果爆炸风险** | 一个 Notebook 可能关联数十个 Source，每个 Source 又可能关联多个 Notebook。2 跳查询可能导致结果数量呈 O(n²) 级增长。例如：10 个匹配的 Source，每个关联 3 个 Notebook，每个 Notebook 再关联 10 个 Source → 可能产生 300+ 个扩展结果。 |
+| **延迟不可预测** | 直接搜索（全文/向量）的延迟相对稳定，因为主要依赖索引查找。而图遍历的延迟取决于：<br>1. 初始结果集大小<br>2. 每个节点的出边/入边数量<br>3. 关系表的索引效率<br>在数据量大时，图遍历可能成为性能瓶颈。 |
+| **资源消耗** | 图遍历需要在内存中构建和处理中间结果集。高并发场景下，多个图遍历查询可能导致：<br>- CPU 使用率飙升（处理大量关系边）<br>- 内存压力增大（存储中间结果）<br>- 数据库连接池耗尽（长查询持有连接） |
+
+**SurrealDB 图遍历的底层实现**：
+
+SurrealDB 的图遍历语法（`->`/`<-` 操作符）底层实际上是通过关系表查询实现的，而非专门的图数据库优化。例如：
+
+```surrealql
+-- 语法糖写法
+SELECT ->reference->notebook FROM source:xxx
+
+-- 等价的展开写法
+SELECT (SELECT out FROM reference WHERE in = source:xxx).out AS notebooks
+FROM source:xxx
+```
+
+这意味着每一跳都涉及一次 `SELECT ... FROM reference WHERE in/out = ...` 查询。如果关系表没有合适的索引，性能会很差。
+
+##### 3.4.4.2 结果可预测性与用户体验
+
+| 问题维度 | 具体分析 |
+|---------|---------|
+| **相关性衰减** | 直接匹配的文档（通过关键词或向量相似度）相关性是明确的。但通过 2 跳、3 跳图路径找到的文档，相关性会急剧衰减。<br><br>**示例**：<br>- 用户搜索"机器学习"<br>- 直接找到 Source A（标题包含"机器学习"）<br>- Source A 属于 Notebook X<br>- Notebook X 中还有 Source B（关于"深度学习"）<br>- Source B 属于 Notebook X，但也属于 Notebook Y<br>- Notebook Y 中还有 Source C（关于"Python 编程"）<br><br>问题：Source C 与"机器学习"的相关性有多高？应该排在什么位置？ |
+| **分数融合困难** | 全文检索的 `relevance`（BM25 分数）和向量检索的 `similarity`（余弦相似度）都是成熟的、可解释的分数。<br><br>但图扩展的结果如何评分？<br>- 方案 A：使用原始搜索中关联节点的分数 × 衰减系数<br>- 方案 B：对扩展结果重新执行一次搜索验证<br>- 方案 C：使用图路径长度作为评分依据<br><br>每种方案都有缺陷：方案 A 可能引入大量低相关结果；方案 B 增加额外查询开销；方案 C 完全忽略语义相关性。 |
+| **去重策略复杂** | 同一文档可能通过多条不同的图路径被找到。例如：<br>- Source A → Notebook X → Source D<br>- Source B → Notebook X → Source D<br><br>问题：当 Source D 通过两条路径被找到时，应该：<br>1. 保留第一次出现的分数？<br>2. 取两条路径中的最高分数？<br>3. 加权求和？<br>4. 考虑路径多样性（通过不同 Notebook 找到的应该加分？） |
+| **用户预期管理** | 用户搜索时通常有明确的信息需求。如果搜索结果中混入大量通过图关系间接关联的文档，用户可能会困惑：<br>- "为什么这篇文档会出现在这里？"<br>- "这和我搜索的关键词有什么关系？"<br><br>缺乏可解释性会降低用户对搜索系统的信任。 |
+
+##### 3.4.4.3 语义可信度与数据模型限制
+
+当前的图关系模型存在**语义局限性**，这是不做图扩展搜索的更深层原因：
+
+| 维度 | 分析 |
+|-----|------|
+| **关系语义单一** | 当前定义的关系只有：<br>- `reference`: source → notebook（"归属"）<br>- `artifact`: note → notebook（"归属"）<br><br>这些关系只表示"组织归属"，**不表示语义相似或主题相关**。 |
+| **组织 vs 语义的混淆** | 两个 Source 共享同一个 Notebook，可能只是因为：<br>1. 用户手动组织（"我把这两个文档放在同一个文件夹"）<br>2. 上传时的默认分组<br>3. 批量导入时的关联<br><br>**这并不意味着这两个 Source 在语义上相关**。<br><br>**反例**：<br>- Notebook "我的学习资料" 中可能同时包含：<br>  - Source A: "Python 机器学习入门"<br>  - Source B: "如何烤蛋糕"<br><br>如果用户搜索"机器学习"，通过图扩展会找到 Source B，这显然是噪音。 |
+| **缺乏细粒度关系类型** | 真正有效的图检索需要更丰富的关系语义，例如：<br>- `cites`/`cited_by`: 引用关系（学术文献）<br>- `related_to`: 显式标记的相关关系<br>- `contradicts`: 对立/相反观点<br>- `extends`: 扩展/续作<br><br>当前模型只有"归属"关系，缺乏这些语义信息。 |
+| **对比：向量检索的优势** | 向量检索天然擅长发现**隐式语义关联**。即使两个文档没有显式关系，只要它们的内容语义相似，向量相似度就会高。<br><br>这比基于显式图关系的扩展更可靠，因为：<br>1. 不依赖用户手动标注关系<br>2. 基于实际内容而非组织方式<br>3. 可以发现跨 Notebook 的语义关联 |
+
+##### 3.4.4.4 现有方案的优势总结
+
+当前"直接搜索 + 合并去重"方案的优势：
+
+| 优势 | 说明 |
+|-----|------|
+| **性能可预测** | 单表查询 + 索引查找，延迟稳定可控。即使数据量增长，性能下降也是线性的。 |
+| **实现简单** | 无需处理图遍历的边界条件：<br>- 循环路径检测<br>- 无限递归防护<br>- 路径数量爆炸 |
+| **调试方便** | 可以直接在 SurrealDB 控制台执行 `fn::text_search()` 或 `fn::vector_search()` 验证搜索逻辑，返回的 SQL 结果易于理解。 |
+| **结果可解释** | 用户可以理解：<br>- "这篇文档被返回是因为标题包含我的搜索词"<br>- "这篇文档被返回是因为内容与我的查询语义相似" |
+| **分数直观** | BM25 和余弦相似度都是成熟的、可解释的分数，用户可以通过调整阈值来控制结果质量。 |
+
+---
+
+#### 3.4.5 扩展方案：如何将图关系纳入混合检索
+
+如果未来确实需要将图关系纳入搜索（例如：添加了更丰富的关系语义、用户明确需要"查找相关文档"功能），可以在现有分层架构上进行扩展。以下分析两种可行方案及其优劣对比。
+
+##### 3.4.5.1 架构扩展点概览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        扩展后的搜索架构                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ API Router Layer (api/routers/search.py)                              │   │
+│  │                                                                          │   │
+│  │  新增请求参数:                                                          │   │
+│  │  - expand_graph: bool (是否启用图扩展)                                  │   │
+│  │  - graph_hops: int (最大扩展跳数，建议 1-2)                            │   │
+│  │  - graph_decay: float (每跳分数衰减系数，如 0.7)                       │   │
+│  │  - notebook_id: Optional[str] (可选：仅在特定 Notebook 内扩展)         │   │
+│  │                                                                          │   │
+│  │  新增端点:                                                              │   │
+│  │  - POST /search/related (专门的"查找相关文档"接口)                      │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                    ↓                                          │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ Domain Layer (open_notebook/domain/notebook.py)                      │   │
+│  │                                                                          │   │
+│  │  方案 A: 应用层图扩展（推荐）                                            │   │
+│  │  ┌────────────────────────────────────────────────────────────────┐   │   │
+│  │  │ 新增函数: hybrid_search_with_graph()                             │   │   │
+│  │  │                                                                  │   │   │
+│  │  │ 执行流程:                                                         │   │   │
+│  │  │ 1. 基础搜索: text_search() / vector_search()                    │   │   │
+│  │  │ 2. 结果收集: 提取匹配的 Source/Note ID                           │   │   │
+│  │  │ 3. 图遍历: 查询这些记录关联的 Notebook                            │   │   │
+│  │  │ 4. 扩展发现: 查询 Notebook 关联的其他 Source/Note                 │   │   │
+│  │  │ 5. 二次检索: 对扩展结果执行轻量搜索（验证相关性）                   │   │   │
+│  │  │ 6. 分数融合: 基础分数 × 衰减系数，与二次检索分数融合               │   │   │
+│  │  │ 7. 重新排序: 按最终分数降序排列                                   │   │   │
+│  │  └────────────────────────────────────────────────────────────────┘   │   │
+│  │                                                                          │   │
+│  │  方案 B: 数据库层图扩展                                                 │   │
+│  │  ┌────────────────────────────────────────────────────────────────┐   │   │
+│  │  │ 新增 SurrealQL 函数: fn::graph_expand_search()                  │   │   │
+│  │  │                                                                  │   │   │
+│  │  │ 执行流程:                                                         │   │   │
+│  │  │ 1. 基础搜索（同现有 fn::text_search/fn::vector_search）          │   │   │
+│  │  │ 2. 图遍历: 使用 SurrealDB 原生图语法（->/<-）                     │   │   │
+│  │  │ 3. 合并: array::union() 基础结果 + 扩展结果                       │   │   │
+│  │  │ 4. 排序: ORDER BY relevance/similarity DESC                      │   │   │
+│  │  └────────────────────────────────────────────────────────────────┘   │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                    ↓                                          │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ Database Layer (open_notebook/database/)                              │   │
+│  │                                                                          │   │
+│  │  方案 A 无需改动数据库层（除了可能需要的索引优化）                       │   │
+│  │                                                                          │   │
+│  │  方案 B 可能需要:                                                        │   │
+│  │  - 新增关系表索引: CREATE INDEX idx_reference_in/out                   │   │
+│  │  - 新增 SurrealQL 函数: migrations/15.surrealql 等                    │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+##### 3.4.5.2 方案 A：应用层图扩展（推荐）
+
+**核心思想**：在 Python 应用层（Domain Layer）控制图扩展逻辑，而不是委托给 SurrealDB。
+
+**实现步骤**：
+
+```python
+# open_notebook/domain/notebook.py 中新增
+
+from typing import List, Dict, Any, Optional
+from enum import Enum
+from dataclasses import dataclass
+
+
+class GraphSearchMode(Enum):
+    """图扩展搜索的模式"""
+    SAME_NOTEBOOK = "same_notebook"      # 仅扩展同一 Notebook 内的文档
+    SHARED_NOTEBOOK = "shared_notebook"   # 扩展共享 Notebook 的文档
+    ALL_NEIGHBORS = "all_neighbors"       # 扩展所有关联邻居（谨慎使用）
+
+
+@dataclass
+class GraphSearchConfig:
+    """图扩展搜索的配置"""
+    enabled: bool = False
+    max_hops: int = 1                    # 最大跳数，建议 1-2
+    decay_factor: float = 0.7            # 每跳的分数衰减系数
+    mode: GraphSearchMode = GraphSearchMode.SAME_NOTEBOOK
+    min_secondary_score: float = 0.3     # 二次检索的最小分数阈值
+    limit_per_hop: int = 20               # 每跳最多扩展的结果数
+
+
+async def hybrid_search_with_graph(
+    keyword: str,
+    search_type: str = "text",           # "text" or "vector"
+    results: int = 100,
+    source: bool = True,
+    note: bool = True,
+    minimum_score: float = 0.2,           # 仅对 vector_search 有效
+    graph_config: Optional[GraphSearchConfig] = None,
+) -> List[Dict[str, Any]]:
+    """
+    支持图扩展的混合搜索。
+    
+    核心设计原则:
+    1. 基础搜索优先（保证核心质量）
+    2. 图扩展作为补充（需要验证相关性）
+    3. 分数衰减明确（用户可感知）
+    """
+    
+    # 默认配置：不启用图扩展
+    if graph_config is None:
+        graph_config = GraphSearchConfig(enabled=False)
+    
+    # ========== 步骤 1: 执行基础搜索 ==========
+    logger.info(f"[hybrid_search] 基础搜索: type={search_type}, keyword={keyword}")
+    
+    if search_type == "vector":
+        base_results = await vector_search(keyword, results, source, note, minimum_score)
+        score_key = "similarity"
+    else:
+        base_results = await text_search(keyword, results, source, note)
+        score_key = "relevance"
+    
+    # 如果不启用图扩展，直接返回基础结果
+    if not graph_config.enabled:
+        return base_results
+    
+    # 标记基础结果的来源和原始分数
+    for r in base_results:
+        r["_source_type"] = "base"
+        r["_original_score"] = r[score_key]
+        r["_hop_count"] = 0
+    
+    # 如果基础结果为空，直接返回
+    if not base_results:
+        return []
+    
+    # ========== 步骤 2: 收集基础结果中的相关实体 ==========
+    # 提取所有匹配的 source_embedding 对应的 source ID
+    # 注意：source_embedding 的 parent_id 指向 source
+    base_source_ids = set()
+    base_note_ids = set()
+    
+    for r in base_results:
+        record_id = str(r.get("id", ""))
+        parent_id = str(r.get("parent_id", ""))
+        
+        # 判断记录类型
+        if record_id.startswith("source_embedding:"):
+            # source_embedding → parent_id 是 source
+            if parent_id:
+                base_source_ids.add(parent_id)
+        elif record_id.startswith("source:"):
+            base_source_ids.add(record_id)
+        elif record_id.startswith("note:"):
+            base_note_ids.add(record_id)
+    
+    logger.info(f"[hybrid_search] 基础结果包含: {len(base_source_ids)} 个 sources, {len(base_note_ids)} 个 notes")
+    
+    # ========== 步骤 3: 图扩展发现 ==========
+    expanded_candidates = []
+    
+    if graph_config.mode in [GraphSearchMode.SAME_NOTEBOOK, GraphSearchMode.SHARED_NOTEBOOK]:
+        # 通过 Notebook 关系扩展
+        
+        # 查询这些 source/note 关联的 notebook
+        # 注意：需要通过 reference/artifact 关系反向查询
+        related_notebooks = set()
+        
+        # 查询 source → reference → notebook
+        if base_source_ids:
+            source_notebooks = await repo_query("""
+                SELECT VALUE DISTINCT out 
+                FROM reference 
+                WHERE in IN $source_ids
+            """, {"source_ids": list(base_source_ids)})
+            related_notebooks.update(source_notebooks)
+        
+        # 查询 note → artifact → notebook
+        if base_note_ids:
+            note_notebooks = await repo_query("""
+                SELECT VALUE DISTINCT out 
+                FROM artifact 
+                WHERE in IN $note_ids
+            """, {"note_ids": list(base_note_ids)})
+            related_notebooks.update(note_notebooks)
+        
+        logger.info(f"[hybrid_search] 关联的 notebooks: {len(related_notebooks)}")
+        
+        if related_notebooks:
+            # 查询这些 notebook 中的其他 source/note
+            # 根据模式决定扩展范围
+            
+            if graph_config.mode == GraphSearchMode.SAME_NOTEBOOK:
+                # 仅获取这些 notebook 中的记录
+                # （但排除已经在基础结果中的）
+                
+                # 查询 notebook 中的其他 sources
+                notebook_sources = await repo_query("""
+                    SELECT VALUE DISTINCT in 
+                    FROM reference 
+                    WHERE out IN $notebook_ids
+                """, {"notebook_ids": list(related_notebooks)})
+                
+                # 查询 notebook 中的其他 notes
+                notebook_notes = await repo_query("""
+                    SELECT VALUE DISTINCT in 
+                    FROM artifact 
+                    WHERE out IN $notebook_ids
+                """, {"notebook_ids": list(related_notebooks)})
+                
+                # 排除已在基础结果中的
+                expand_source_ids = [s for s in notebook_sources if s not in base_source_ids]
+                expand_note_ids = [n for n in notebook_notes if n not in base_note_ids]
+                
+                logger.info(f"[hybrid_search] 待扩展: {len(expand_source_ids)} sources, {len(expand_note_ids)} notes")
+                
+                # 收集为候选
+                for sid in expand_source_ids[:graph_config.limit_per_hop]:
+                    expanded_candidates.append({
+                        "id": sid,
+                        "_source_type": "expanded",
+                        "_hop_count": 1,
+                        "_expansion_reason": f"shared_notebook",
+                    })
+                
+                for nid in expand_note_ids[:graph_config.limit_per_hop]:
+                    expanded_candidates.append({
+                        "id": nid,
+                        "_source_type": "expanded",
+                        "_hop_count": 1,
+                        "_expansion_reason": f"shared_notebook",
+                    })
+    
+    # ========== 步骤 4: 对扩展候选执行二次检索（验证相关性） ==========
+    # 关键：不直接接受图扩展的结果，而是对候选执行一次轻量搜索验证
+    # 这样可以过滤掉"同属一个 Notebook 但语义不相关"的噪音
+    
+    validated_results = []
+    
+    if expanded_candidates:
+        logger.info(f"[hybrid_search] 执行二次检索验证，候选数: {len(expanded_candidates)}")
+        
+        # 提取候选的 ID 列表
+        candidate_ids = [c["id"] for c in expanded_candidates]
+        
+        if search_type == "vector":
+            # 向量检索：需要先生成查询向量
+            from open_notebook.utils.embedding import generate_embedding
+            query_embedding = await generate_embedding(keyword)
+            
+            # 对候选执行向量相似度计算
+            # 注意：这里只在候选范围内搜索
+            secondary_results = await repo_query("""
+                SELECT 
+                    id,
+                    parent_id,
+                    title,
+                    vector::similarity::cosine(embedding, $query_embedding) as similarity
+                FROM (
+                    SELECT * FROM source_embedding WHERE source IN $candidate_ids
+                    UNION ALL
+                    SELECT * FROM source_insight WHERE source IN $candidate_ids
+                    UNION ALL
+                    SELECT * FROM note WHERE id IN $candidate_ids
+                )
+                WHERE embedding != NONE
+                  AND vector::similarity::cosine(embedding, $query_embedding) >= $min_score
+                ORDER BY similarity DESC
+                LIMIT $limit
+            """, {
+                "query_embedding": query_embedding,
+                "candidate_ids": candidate_ids,
+                "min_score": graph_config.min_secondary_score,
+                "limit": results,
+            })
+            
+            # 处理 secondary_results，添加元数据
+            for r in secondary_results:
+                r["_source_type"] = "validated_expansion"
+                r["_hop_count"] = 1
+                r["_original_score"] = r["similarity"]
+                # 应用衰减
+                r["similarity"] = r["similarity"] * graph_config.decay_factor
+                validated_results.append(r)
+                
+        else:
+            # 全文检索：对候选执行关键词匹配
+            secondary_results = await repo_query("""
+                SELECT 
+                    id,
+                    parent_id,
+                    title,
+                    math::max(search::score(1)) as relevance
+                FROM (
+                    SELECT id, parent_id, title FROM source WHERE id IN $candidate_ids AND title @1@ $keyword
+                    UNION ALL
+                    SELECT source.id as id, source.id as parent_id, source.title as title 
+                    FROM source_embedding WHERE source IN $candidate_ids AND content @1@ $keyword
+                    UNION ALL
+                    SELECT id, id as parent_id, title FROM note WHERE id IN $candidate_ids 
+                    AND (title @1@ $keyword OR content @1@ $keyword)
+                )
+                GROUP BY id, parent_id, title
+                HAVING relevance >= $min_score
+                ORDER BY relevance DESC
+                LIMIT $limit
+            """, {
+                "keyword": keyword,
+                "candidate_ids": candidate_ids,
+                "min_score": graph_config.min_secondary_score,
+                "limit": results,
+            })
+            
+            # 处理 secondary_results
+            for r in secondary_results:
+                r["_source_type"] = "validated_expansion"
+                r["_hop_count"] = 1
+                r["_original_score"] = r["relevance"]
+                # 应用衰减
+                r["relevance"] = r["relevance"] * graph_config.decay_factor
+                validated_results.append(r)
+    
+    logger.info(f"[hybrid_search] 二次验证通过: {len(validated_results)} 个结果")
+    
+    # ========== 步骤 5: 合并、去重、重新排序 ==========
+    
+    # 合并基础结果和验证后的扩展结果
+    all_results = base_results + validated_results
+    
+    # 去重：保留最高分数
+    # 使用字典，key 为 (id, parent_id)
+    deduped = {}
+    
+    for r in all_results:
+        key = (str(r.get("id", "")), str(r.get("parent_id", "")))
+        
+        if key not in deduped:
+            deduped[key] = r
+        else:
+            # 比较分数，保留较高的
+            existing_score = deduped[key].get(score_key, 0)
+            current_score = r.get(score_key, 0)
+            
+            if current_score > existing_score:
+                # 如果扩展结果的分数更高（经过衰减后），保留它
+                # 但保留 _source_type 为 "base" 以指示来源
+                r["_source_type"] = deduped[key].get("_source_type", "base")
+                deduped[key] = r
+    
+    # 转换为列表并排序
+    final_results = list(deduped.values())
+    final_results.sort(key=lambda x: x.get(score_key, 0), reverse=True)
+    
+    # 限制数量
+    final_results = final_results[:results]
+    
+    logger.info(f"[hybrid_search] 最终结果: {len(final_results)} 个 (基础 {len(base_results)}, 扩展 {len(validated_results)})")
+    
+    return final_results
+```
+
+**方案 A 的配套数据访问方法**：
+
+```python
+# 需要在 Source 和 Notebook 类中补充以下方法
+
+class Source(ObjectModel):
+    # ... 现有代码 ...
+    
+    async def get_linked_notebooks(self) -> List[str]:
+        """获取此 Source 关联的所有 Notebook ID"""
+        result = await repo_query("""
+            SELECT VALUE out 
+            FROM reference 
+            WHERE in = $source_id
+        """, {"source_id": ensure_record_id(self.id)})
+        return [str(r) for r in result]
+    
+    async def get_notebook_context(self) -> Dict[str, Any]:
+        """获取此 Source 在各 Notebook 中的上下文信息"""
+        notebooks = await self.get_linked_notebooks()
+        # 可以扩展：查询 Notebook 中的其他 Source，计算相似度等
+        return {"notebooks": notebooks}
+
+
+class Notebook(ObjectModel):
+    # ... 现有代码 ...
+    
+    async def search_within(
+        self, 
+        keyword: str, 
+        search_type: str = "text",
+        limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """在此 Notebook 范围内搜索"""
+        # 获取此 Notebook 中的所有 source 和 note
+        source_ids = await repo_query("""
+            SELECT VALUE in FROM reference WHERE out = $notebook_id
+        """, {"notebook_id": ensure_record_id(self.id)})
+        
+        note_ids = await repo_query("""
+            SELECT VALUE in FROM artifact WHERE out = $notebook_id
+        """, {"notebook_id": ensure_record_id(self.id)})
+        
+        # 对这些 ID 执行搜索（可以复用现有逻辑）
+        # ...
+        
+        return []
+```
+
+**方案 A 的优劣分析**：
+
+| 优势 | 劣势 |
+|-----|------|
+| **灵活可控**：可以精确控制扩展逻辑、分数融合策略、二次验证机制 | **多次数据库往返**：基础搜索 → 图查询 → 二次检索，涉及多次数据库交互 |
+| **业务规则丰富**：可以应用复杂的业务规则，如"仅在特定 Notebook 内扩展"、"排除某些类型的文档"等 | **部分逻辑重复**：二次检索的逻辑与基础搜索有重叠，需要维护两份相似代码 |
+| **易于调试**：Python 代码易于添加日志、断点调试，可以清晰地看到每一步的结果 | **需要额外索引**：关系表的 `in` 和 `out` 字段可能需要索引来加速图查询 |
+| **渐进式增强**：可以作为现有搜索的**可选增强**，默认关闭，用户显式请求时才启用 | |
+| **安全性高**：二次验证机制可以过滤掉大部分噪音，保证扩展结果的质量 | |
+
+---
+
+##### 3.4.5.3 方案 B：数据库层图扩展
+
+**核心思想**：在 SurrealQL 函数中直接使用图遍历语法，利用 SurrealDB 的原生能力。
+
+**实现示例**：
+
+```surrealql
+-- migrations/15_graph_search.surrealql
+
+DEFINE FUNCTION IF NOT EXISTS fn::hybrid_search_with_graph(
+    $query_text: string,
+    $match_count: int,
+    $sources: bool,
+    $show_notes: bool,
+    $expand_graph: bool,
+    $max_hops: int,
+    $decay_factor: float
+) {
+    -- ========== 步骤 1: 基础搜索 ==========
+    let $base_results = SELECT * FROM fn::text_search(
+        $query_text, $match_count * 2, $sources, $show_notes
+    );
+    
+    IF !$expand_graph OR $max_hops <= 0 {
+        RETURN $base_results LIMIT $match_count;
+    }
+    
+    -- 标记基础结果
+    LET $base_with_meta = SELECT 
+        *,
+        "base" as _source_type,
+        0 as _hop_count
+    FROM $base_results;
+    
+    -- ========== 步骤 2: 图扩展 ==========
+    -- 收集基础结果中的 ID
+    LET $base_ids = SELECT VALUE id FROM $base_results;
+    
+    -- 查找这些 ID 关联的 Notebook
+    -- 注意：需要区分 source 和 note
+    LET $linked_notebooks = SELECT VALUE DISTINCT array::concat(
+        (SELECT VALUE out FROM reference WHERE in IN $base_ids),
+        (SELECT VALUE out FROM artifact WHERE in IN $base_ids)
+    );
+    
+    LET $flat_notebooks = array::flatten($linked_notebooks);
+    
+    IF array::len($flat_notebooks) = 0 {
+        RETURN $base_with_meta LIMIT $match_count;
+    }
+    
+    -- 查找这些 Notebook 中的其他 Source/Note
+    LET $expanded_sources = SELECT VALUE in 
+        FROM reference 
+        WHERE out IN $flat_notebooks 
+          AND in NOT IN $base_ids;
+    
+    LET $expanded_notes = SELECT VALUE in 
+        FROM artifact 
+        WHERE out IN $flat_notebooks 
+          AND in NOT IN $base_ids;
+    
+    LET $all_expanded = array::union($expanded_sources, $expanded_notes);
+    
+    IF array::len($all_expanded) = 0 {
+        RETURN $base_with_meta LIMIT $match_count;
+    }
+    
+    -- ========== 步骤 3: 对扩展结果执行关键词匹配（验证） ==========
+    LET $expanded_results = SELECT 
+        id,
+        parent_id,
+        title,
+        search::score(1) * $decay_factor as relevance,
+        "expanded" as _source_type,
+        1 as _hop_count
+    FROM (
+        SELECT id, id as parent_id, title FROM source 
+        WHERE id IN $all_expanded AND title @1@ $query_text
+        
+        UNION ALL
+        
+        SELECT source.id as id, source.id as parent_id, source.title as title 
+        FROM source_embedding 
+        WHERE source IN $all_expanded AND content @1@ $query_text
+        
+        UNION ALL
+        
+        SELECT id, id as parent_id, title FROM note 
+        WHERE id IN $all_expanded AND (title @1@ $query_text OR content @1@ $query_text)
+    )
+    GROUP BY id, parent_id, title
+    ORDER BY relevance DESC
+    LIMIT $match_count;
+    
+    -- ========== 步骤 4: 合并并去重 ==========
+    LET $all_results = array::union($base_with_meta, $expanded_results);
+    
+    RETURN (
+        SELECT 
+            id, 
+            parent_id, 
+            title, 
+            math::max(relevance) as relevance,
+            array::first(_source_type) as _source_type,  -- 优先保留 "base"
+            math::min(_hop_count) as _hop_count
+        FROM $all_results 
+        GROUP BY id, parent_id, title 
+        ORDER BY relevance DESC 
+        LIMIT $match_count
+    );
+};
+```
+
+**方案 B 的优劣分析**：
+
+| 优势 | 劣势 |
+|-----|------|
+| **单次查询**：所有逻辑在一个 SurrealQL 函数中完成，减少网络往返 | **SurrealQL 能力限制**：复杂的条件逻辑、循环、数据结构操作在 SurrealQL 中表达困难 |
+| **利用数据库优化**：SurrealDB 可能对图遍历语法有内部优化（虽然当前实现主要是语法糖） | **调试困难**：SurrealQL 函数的调试体验远不如 Python，缺乏日志、断点、错误堆栈 |
+| **原子性**：整个搜索过程在数据库层面是原子的 | **分数融合受限**：难以实现复杂的分数融合策略（如 RRF、加权求和） |
+| | **性能不可控**：图遍历在数据量大时可能很慢，且难以诊断和优化 |
+| | **版本依赖**：SurrealDB 的图语法和行为可能在版本间变化 |
+
+---
+
+##### 3.4.5.4 两种方案对比总结
+
+| 维度 | 方案 A（应用层图扩展） | 方案 B（数据库层图扩展） |
+|-----|----------------------|-----------------------|
+| **推荐度** | ⭐⭐⭐⭐⭐ 强烈推荐 | ⭐⭐ 谨慎考虑 |
+| **实现复杂度** | 中等（Python 代码） | 高（SurrealQL 限制多） |
+| **调试体验** | 优秀（日志、断点） | 困难（SurrealQL 工具链弱） |
+| **性能** | 多次数据库往返 | 单次查询 |
+| **灵活性** | 极高（可任意定制） | 有限（受 SurrealQL 能力限制） |
+| **业务规则** | 易于集成 | 难以表达复杂业务规则 |
+| **渐进式增强** | 支持（可选启用） | 可能需要替换现有函数 |
+| **安全性** | 高（二次验证机制） | 中等（依赖数据库查询优化） |
+
+**最终建议**：
+
+1. **短期**：采用**方案 A**，在 `open_notebook/domain/notebook.py` 中实现 `hybrid_search_with_graph()` 函数，作为现有 `text_search()` 和 `vector_search()` 的**可选增强**。
+
+2. **API 设计**：不修改现有 `/search` 端点的默认行为，而是：
+   - 添加可选参数 `expand_graph`（默认 `false`）
+   - 或者新增专门的端点 `/search/related` 用于显式的图扩展搜索
+
+3. **关键保障**：**必须实现二次验证机制**，即对图扩展发现的候选结果执行一次轻量的全文/向量搜索验证，过滤掉"同属一个 Notebook 但语义不相关"的噪音。
+
+4. **长期**：如果 SurrealDB 未来增强了图数据库能力（如原生图索引、更丰富的图算法），可以考虑迁移到方案 B 或混合方案。
+
 ---
 
 ## 4. 查询结果的合并、去重和排序
@@ -1230,21 +1873,36 @@ LIMIT $match_count 限制数量
 4. **灵活的重试策略**: 区分临时故障和永久错误
 5. **多模型支持**: Ask 功能使用三个不同模型 (策略/答案/最终答案)
 
-### 7.5 潜在改进点
+### 7.5 设计决策总结
 
-1. **图关系搜索**: 当前未使用图遍历扩展搜索结果，可考虑实现:
-   - 通过共享 Notebook 查找相关 Source
-   - 通过引用关系扩展搜索范围
+| 决策点 | 当前选择 | 理由 |
+|-------|---------|------|
+| **搜索时不做图遍历** | 直接表查询 + 索引查找 | 性能可预测、实现简单、结果可解释 |
+| **向量/全文检索分离** | 两种独立模式，用户选择 | 分数语义不同（BM25 vs 余弦相似度），融合需要额外设计 |
+| **异步嵌入** | surreal-commands 后台任务 | 不阻塞主请求，支持重试和幂等 |
+| **数据库层聚合** | SurrealQL 函数内合并去重排序 | 减少数据传输，利用数据库优化 |
 
-2. **混合分数融合**: 向量检索和全文检索是独立的两种模式，可考虑实现:
+### 7.6 未来扩展方向
+
+1. **混合分数融合**（向量 + 全文）:
    - 同时执行两种检索
-   - 分数归一化后融合排序
+   - 分数归一化（如 min-max scaling、z-score）
+   - 加权融合或 RRF (Reciprocal Rank Fusion)
 
-3. **嵌入状态跟踪**: 异步嵌入缺少明确的状态反馈机制，用户无法知道嵌入是否完成
+2. **图关系扩展搜索**（详见 3.4.5）:
+   - 推荐方案：应用层图扩展（Domain Layer）
+   - 新增参数：`expand_graph`, `graph_hops`
+   - 分数衰减策略：1 跳 0.7，2 跳 0.4
+
+3. **嵌入状态跟踪**:
+   - 为异步嵌入任务添加状态查询 API
+   - 在 Source/Note 模型中添加 `embedding_status` 字段
 
 ---
 
 ## 8. 关键代码位置索引
+
+### 8.1 服务端搜索链路（核心）
 
 | 功能模块 | 文件路径 | 关键函数/类 |
 |---------|----------|------------|
@@ -1258,6 +1916,15 @@ LIMIT $match_count 限制数量
 | 关系操作 | `open_notebook/database/repository.py` | `repo_relate()` |
 | 数据库连接 | `open_notebook/database/repository.py` | `db_connection()`, `repo_query()` |
 
+### 8.2 客户端组件（不参与服务端搜索链路）
+
+| 组件 | 文件路径 | 定位 | 使用者 |
+|-----|----------|------|--------|
+| HTTP 客户端 | `api/client.py` | `APIClient` 类，基于 `httpx` | 命令行工具、外部脚本 |
+| 搜索客户端封装 | `api/search_service.py` | `SearchService` 类，封装 `APIClient` | 命令行工具、外部脚本 |
+| 前端 API 调用 | `frontend/src/lib/api/search.ts` | `searchApi` 对象，基于 `fetch` | Next.js 前端应用 |
+
 ---
 
-*报告生成日期: 2026-04-27*
+*报告更新日期: 2026-04-27*
+*修正内容: 架构图修正（客户端组件定位）、图关系查询设计权衡分析、代码位置索引扩展*
