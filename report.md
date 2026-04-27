@@ -926,6 +926,173 @@ for attempt in range(1, EMBEDDING_MAX_RETRIES + 1):
 - `EMBEDDING_MAX_RETRIES`: 最大重试次数（默认 3）
 - `EMBEDDING_RETRY_DELAY`: 重试延迟（默认 2 秒）
 
+#### 4.6.1 异常链断裂问题
+
+**关键发现**：向量化服务的异常处理与其他服务路径存在不一致，重试耗尽后抛出的异常**不属于项目统一的异常体系**。
+
+**问题一：异常类型不属于 `OpenNotebookError` 体系**
+
+向量化服务中抛出的异常类型：
+
+```python
+# open_notebook/utils/embedding.py:140-142
+if not embedding_model:
+    raise ValueError(
+        "No embedding model configured. Please configure one in the Models section."
+    )
+
+# open_notebook/utils/embedding.py:199-203
+raise RuntimeError(
+    f"Failed to generate embeddings using model '{model_name}' "
+    f"(batch {batch_idx + 1}/{total_batches}, "
+    f"{len(batch)} texts): {e}"
+) from e
+```
+
+这些异常是 Python 内置的 `ValueError` 和 `RuntimeError`，**不是 `OpenNotebookError` 的子类**。
+
+**问题二：跳过了错误分类器 `classify_error()`**
+
+其他服务路径（对话图、转换图等）都显式调用 `classify_error()` 将底层异常转换为类型化异常：
+
+```python
+# 其他服务的标准模式（以 chat.py 为例）
+# open_notebook/graphs/chat.py:81-85
+except OpenNotebookError:
+    raise  # 已经是系统异常，直接抛出
+except Exception as e:
+    error_class, user_message = classify_error(e)  # ← 关键：统一分类
+    raise error_class(user_message) from e
+```
+
+而向量化服务**完全跳过了这一步**：
+
+```python
+# open_notebook/utils/embedding.py:179-203
+for attempt in range(1, EMBEDDING_MAX_RETRIES + 1):
+    try:
+        batch_embeddings = await embedding_model.aembed(batch)
+        all_embeddings.extend(batch_embeddings)
+        break
+    except Exception as e:
+        # ... 重试逻辑 ...
+        else:
+            # 重试耗尽后直接抛出 RuntimeError
+            raise RuntimeError(
+                f"Failed to generate embeddings using model '{model_name}' "
+                f"(batch {batch_idx + 1}/{total_batches}, "
+                f"{len(batch)} texts): {e}"
+            ) from e
+```
+
+**问题三：两条异常路径的对比**
+
+| 维度 | 其他服务路径 | 向量化服务路径 |
+|------|-------------|---------------|
+| 底层异常捕获 | ✅ 有 | ✅ 有 |
+| 调用 `classify_error()` | ✅ 显式调用 | ❌ 完全跳过 |
+| 异常类型 | `OpenNotebookError` 子类 | `ValueError` / `RuntimeError` |
+| 异常语义 | 类型化（认证失败/限流/网络错误等） | 非类型化（通用错误） |
+
+**问题四：全局异常处理器无法正确处理**
+
+全局异常处理器只处理 `OpenNotebookError` 及其子类：
+
+```python
+# api/main.py:280-286
+@app.exception_handler(OpenNotebookError)
+async def open_notebook_error_handler(request: Request, exc: OpenNotebookError):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+        headers=_cors_headers(request),
+    )
+```
+
+对于 `ValueError` 和 `RuntimeError`，FastAPI 会使用默认的异常处理，最终返回 500 状态码。
+
+**问题五：对用户可见错误消息的影响**
+
+两种路径的错误消息差异：
+
+**其他服务路径**（经过 `classify_error()`）：
+- 认证失败 → `"Authentication failed. Please check your API key in Settings -> Credentials."`
+- 限流 → `"Rate limit exceeded. Please wait a moment and try again."`
+- 网络错误 → `"Could not connect to the AI provider. Please check your network connection and provider URL."`
+- 上下文超限 → `"Content too large for the selected model. Try using a smaller selection or a model with a larger context window."`
+
+**向量化服务路径**（跳过 `classify_error()`）：
+- 所有错误 → `"Failed to generate embeddings using model 'xxx' (batch 1/1, 1 texts): <原始错误消息>"`
+
+**影响分析**：
+
+1. **用户无法理解错误原因**：原始错误消息可能是技术化的（如 `"401 Unauthorized"`、`"Connection timeout"`），用户无法理解具体问题
+2. **缺少可操作建议**：没有告诉用户应该检查 API 密钥、稍后重试、检查网络等
+3. **错误语义丢失**：认证失败、限流、网络错误等不同类型的错误，对用户来说看起来都是一样的「向量化失败」
+
+**设计取舍评价**
+
+**向量化服务跳过错误分类器的可能原因**：
+
+1. **向量化是后台任务**：向量化操作通常是异步执行的（通过命令队列），错误可能只记录在日志中，用户不会直接看到
+2. **简化实现**：向量化服务的错误处理相对简单，重试耗尽后只需抛出一个通用错误
+3. **历史遗留**：可能向量化服务开发较早，错误分类器是后来引入的，没有同步更新
+
+**这种不一致性的问题**：
+
+1. **维护成本增加**：两种不同的错误处理模式，修改时需要同时更新两处
+2. **用户体验不一致**：同样是「API 密钥无效」，在对话时用户看到清晰的提示，在向量化时只看到晦涩的技术错误
+3. **监控困难**：类型化异常便于按错误类型统计和监控，而非类型化异常难以分析
+
+**改进建议**：
+
+如果要统一错误处理，可以采用以下策略：
+
+**策略 A：在向量化服务中添加 `classify_error()` 调用**
+
+```python
+# 改进后的模式
+from open_notebook.utils.error_classifier import classify_error
+
+for attempt in range(1, EMBEDDING_MAX_RETRIES + 1):
+    try:
+        batch_embeddings = await embedding_model.aembed(batch)
+        all_embeddings.extend(batch_embeddings)
+        break
+    except Exception as e:
+        if attempt < EMBEDDING_MAX_RETRIES:
+            # ... 重试逻辑 ...
+        else:
+            # 重试耗尽后，先分类再抛出
+            error_class, user_message = classify_error(e)
+            raise error_class(
+                f"Failed to generate embeddings using model '{model_name}': {user_message}"
+            ) from e
+```
+
+**策略 B：在路由层统一处理**
+
+在 `embedding.py` 的路由层，即使捕获到非类型化异常，也显式调用 `classify_error()`：
+
+```python
+# api/routers/embedding.py 改进后的异常处理
+from open_notebook.utils.error_classifier import classify_error
+
+except HTTPException:
+    raise
+except OpenNotebookError:
+    raise  # 已经是类型化异常，直接抛出
+except Exception as e:
+    # 非类型化异常，先分类
+    error_class, user_message = classify_error(e)
+    logger.error(
+        f"Error embedding {embed_request.item_type} {embed_request.item_id}: {str(e)}"
+    )
+    # 可以选择抛出类型化异常让全局处理器处理，
+    # 或直接抛出 HTTPException 并使用正确的状态码
+    raise error_class(user_message) from e
+```
+
 ### 4.7 API 层异常转换
 
 FastAPI 路由层将系统异常转换为 HTTP 响应。但这里存在一个**重要的设计问题**：
