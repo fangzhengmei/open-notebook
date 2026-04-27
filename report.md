@@ -622,6 +622,141 @@ class Strategy(BaseModel):
 
 这是一个典型的**规划-执行**模式，通过结构化输出让模型生成搜索计划，而非真正调用外部工具。
 
+#### 3.7.6 跨提供商动机：原生工具调用为何无法统一
+
+项目选择**结构化 JSON 输出**替代**原生工具调用**，这一决策在多提供商抽象层的语境下有深刻的技术合理性。
+
+**问题一：原生工具调用的提供商支持不一致**
+
+原生 function calling 是 OpenAI 率先推出的特性，不同提供商的支持情况差异巨大：
+
+| 提供商 | Function Calling 支持状态 | 说明 |
+|--------|---------------------------|------|
+| OpenAI | ✅ 完整支持 | GPT 系列原生支持，接口稳定 |
+| Anthropic | ✅ 完整支持 | Claude 3+ 支持，格式略有不同 |
+| Google Gemini | ✅ 完整支持 | 原生支持 |
+| Mistral | ⚠️ 部分支持 | 较新模型支持，旧模型不支持 |
+| Groq | ⚠️ 依赖模型 | 部分模型支持 |
+| Ollama / 本地模型 | ❌ 高度不确定 | 取决于具体模型和量化方式 |
+| OpenAI-Compatible | ❌ 不确定 | 取决于后端实际提供商 |
+| 国内厂商 (DashScope, MiniMax) | ⚠️ 部分支持 | 支持程度参差不齐 |
+
+**更关键的问题：接口格式不统一**
+
+即使支持 function calling 的提供商，其接口格式也存在差异：
+
+1. **OpenAI 格式**：
+```json
+{
+  "tool_calls": [
+    {
+      "id": "call_abc123",
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "arguments": "{\"location\": \"Beijing\"}"
+      }
+    }
+  ]
+}
+```
+
+2. **Anthropic Claude 格式**：
+```json
+{
+  "content": [
+    {
+      "type": "tool_use",
+      "id": "toolu_012345",
+      "name": "get_weather",
+      "input": {"location": "Beijing"}
+    }
+  ]
+}
+```
+
+3. **本地模型的模拟方式**：
+大多数本地模型（如 Llama、Mistral 等）不原生支持 function calling，需要通过 Prompt 引导输出 JSON 来模拟：
+```
+你是一个有用的助手。当你需要调用工具时，请输出以下格式的 JSON：
+{"tool_calls": [{"name": "tool_name", "arguments": {...}}]}
+```
+
+这种模拟方式的行为高度不确定，不同模型对 Prompt 的遵从程度差异很大。
+
+**问题二：LangChain 工具调用的抽象泄漏**
+
+虽然 LangChain 提供了 `bind_tools()` 接口试图统一，但底层仍然存在抽象泄漏：
+
+```python
+# LangChain 的 bind_tools 实际上是将工具定义转换为不同提供商的格式
+# 对于不支持原生 function calling 的模型，这个调用会失败或产生意外行为
+
+# 示例：如果模型不支持工具调用，bind_tools 可能：
+# 1. 静默失败，工具定义被忽略
+# 2. 抛出异常
+# 3. 尝试将工具定义注入 Prompt（取决于具体适配器实现）
+```
+
+更严重的是，工具调用的响应解析也存在差异：
+- OpenAI: `ai_message.tool_calls` 是标准格式
+- Anthropic: 格式不同，LangChain 需要转换
+- 本地模型: 可能根本没有 `tool_calls` 属性
+
+**解决方案：结构化 JSON 输出实现真正的跨提供商一致性**
+
+项目采用的方案是**最低公分母**策略：
+
+```python
+# open_notebook/graphs/ask.py:51-75
+parser = PydanticOutputParser(pydantic_object=Strategy)
+
+# 1. 使用 PydanticOutputParser 生成格式指令，注入到 Prompt 中
+system_prompt = Prompter(prompt_template="ask/entry", parser=parser).render(
+    data=state
+)
+
+# 2. 使用 structured 参数提示模型输出 JSON
+model = await provision_langchain_model(
+    system_prompt,
+    config.get("configurable", {}).get("strategy_model"),
+    "tools",
+    max_tokens=2000,
+    structured=dict(type="json"),  # 关键：告诉模型输出 JSON
+)
+
+# 3. 模型调用后手动解析 JSON
+ai_message = await model.ainvoke(system_prompt)
+message_content = extract_text_content(ai_message.content)
+cleaned_content = clean_thinking_content(message_content)
+strategy = parser.parse(cleaned_content)  # 统一解析
+```
+
+**这种方案的优势**：
+
+| 维度 | 结构化 JSON 输出 | 原生工具调用 (bind_tools) |
+|------|-----------------|---------------------------|
+| 提供商兼容性 | ✅ 任何能遵循 Prompt 指令输出 JSON 的模型 | ❌ 仅支持部分提供商 |
+| 接口一致性 | ✅ 完全统一（Prompt + Pydantic 解析） | ⚠️ 底层格式存在差异 |
+| 错误处理 | ✅ 解析失败时可通过 `try/except` 统一捕获 | ⚠️ 不同提供商的错误格式不同 |
+| 本地模型支持 | ✅ 只要模型能输出 JSON 即可 | ❌ 大多数本地模型不支持 |
+| 调试可见性 | ✅ 可以看到完整的模型输出，便于调试 | ⚠️ tool_calls 是框架内部处理的 |
+| 控制粒度 | ✅ 可以通过 Prompt 精细控制输出格式 | ⚠️ 依赖模型的内置行为 |
+
+**这正是「抽象层吸收差异」的实际答案**：
+
+原生工具调用的问题在于，它是一个**可选特性**，各提供商的支持程度和实现方式差异巨大。Esperanto 和 LangChain 虽然试图抽象，但这种抽象是**泄漏的**——底层差异会向上渗透。
+
+而结构化 JSON 输出则是一个**最低公分母**的方案：
+
+1. **Prompt 引导是统一的**：无论哪个提供商，都可以通过 Prompt 要求模型输出 JSON
+2. **Pydantic 解析是统一的**：`parser.parse()` 是纯 Python 逻辑，与提供商无关
+3. **错误处理是统一的**：解析失败时抛出的异常是一致的
+
+几乎所有现代 LLM 都能遵循 Prompt 指令输出 JSON 格式。通过 `PydanticOutputParser` 生成格式指令、通过 `parser.parse()` 统一解析，项目实现了**真正的跨提供商行为一致性**。
+
+这解释了为什么代码中 `bind_tools(tools)` 被注释掉了——这不是一个疏忽，而是一个**有意的架构决策**：在多提供商场景下，结构化输出比原生工具调用更能实现「抽象层吸收差异」的设计目标。
+
 ---
 
 ## 4. 异常处理与分流策略
@@ -793,20 +928,227 @@ for attempt in range(1, EMBEDDING_MAX_RETRIES + 1):
 
 ### 4.7 API 层异常转换
 
-FastAPI 路由层将系统异常转换为 HTTP 响应：
+FastAPI 路由层将系统异常转换为 HTTP 响应。但这里存在一个**重要的设计问题**：
+
+#### 4.7.1 全局异常处理器：类型化异常到状态码的正确映射
+
+`api/main.py` 中定义了完整的全局异常处理器，实现了类型化异常到 HTTP 状态码的正确映射：
 
 ```python
-# api/routers/chat.py:400-408
-except Exception as e:
-    # 记录详细错误用于调试
-    logger.error(
-        f"Error executing chat: {str(e)}\n"
-        f"  Session ID: {request.session_id}\n"
-        f"  Model override: {request.model_override}\n"
-        f"  Traceback:\n{traceback.format_exc()}"
+# api/main.py:217-286
+@app.exception_handler(NotFoundError)
+async def not_found_error_handler(request: Request, exc: NotFoundError):
+    return JSONResponse(
+        status_code=404,
+        content={"detail": str(exc)},
+        headers=_cors_headers(request),
     )
-    raise HTTPException(status_code=500, detail=f"Error executing chat: {str(e)}")
+
+@app.exception_handler(InvalidInputError)
+async def invalid_input_error_handler(request: Request, exc: InvalidInputError):
+    return JSONResponse(
+        status_code=400,
+        content={"detail": str(exc)},
+        headers=_cors_headers(request),
+    )
+
+@app.exception_handler(AuthenticationError)
+async def authentication_error_handler(request: Request, exc: AuthenticationError):
+    return JSONResponse(
+        status_code=401,
+        content={"detail": str(exc)},
+        headers=_cors_headers(request),
+    )
+
+@app.exception_handler(RateLimitError)
+async def rate_limit_error_handler(request: Request, exc: RateLimitError):
+    return JSONResponse(
+        status_code=429,
+        content={"detail": str(exc)},
+        headers=_cors_headers(request),
+    )
+
+@app.exception_handler(ConfigurationError)
+async def configuration_error_handler(request: Request, exc: ConfigurationError):
+    return JSONResponse(
+        status_code=422,
+        content={"detail": str(exc)},
+        headers=_cors_headers(request),
+    )
+
+@app.exception_handler(NetworkError)
+async def network_error_handler(request: Request, exc: NetworkError):
+    return JSONResponse(
+        status_code=502,
+        content={"detail": str(exc)},
+        headers=_cors_headers(request),
+    )
+
+@app.exception_handler(ExternalServiceError)
+async def external_service_error_handler(request: Request, exc: ExternalServiceError):
+    return JSONResponse(
+        status_code=502,
+        content={"detail": str(exc)},
+        headers=_cors_headers(request),
+    )
+
+@app.exception_handler(OpenNotebookError)
+async def open_notebook_error_handler(request: Request, exc: OpenNotebookError):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+        headers=_cors_headers(request),
+    )
 ```
+
+**类型化异常到 HTTP 状态码的映射表**：
+
+| 异常类型 | HTTP 状态码 | 语义 |
+|----------|-------------|------|
+| `NotFoundError` | 404 | 资源不存在 |
+| `InvalidInputError` | 400 | 输入参数错误 |
+| `AuthenticationError` | 401 | 认证失败（API 密钥无效） |
+| `RateLimitError` | 429 | 限流 |
+| `ConfigurationError` | 422 | 配置错误（模型不存在、未配置默认模型等） |
+| `NetworkError` | 502 | 网络错误（无法连接到提供商） |
+| `ExternalServiceError` | 502 | 外部服务错误（上下文超限、提供商 5xx 等） |
+| 其他 `OpenNotebookError` | 500 | 通用服务器错误 |
+
+#### 4.7.2 路由层的问题：所有异常被统一吞转为 500
+
+**问题发现**：虽然全局异常处理器定义了正确的状态码映射，但在各路由端点中，异常通常被 `try/except` 捕获并统一转为 `HTTPException(status_code=500)`，这会**短路全局异常处理器**。
+
+例如 `api/routers/chat.py` 中的 `execute_chat`：
+
+```python
+# api/routers/chat.py:330-408
+@router.post("/chat/execute", response_model=ExecuteChatResponse)
+async def execute_chat(request: ExecuteChatRequest):
+    try:
+        # ... 业务逻辑 ...
+        result = chat_graph.invoke(...)
+        # ...
+        return ExecuteChatResponse(...)
+    except NotFoundError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    except Exception as e:  # ← 问题在这里！
+        # 所有其他异常，包括 AuthenticationError、RateLimitError 等，
+        # 都被捕获并转为 500
+        logger.error(
+            f"Error executing chat: {str(e)}\n"
+            f"  Session ID: {request.session_id}\n"
+            f"  Traceback:\n{traceback.format_exc()}"
+        )
+        raise HTTPException(status_code=500, detail=f"Error executing chat: {str(e)}")
+```
+
+**问题分析**：
+
+| 异常类型 | 全局处理器期望的状态码 | 路由层实际返回 |
+|----------|------------------------|-----------------|
+| `NotFoundError` | 404 | ✅ 404（显式处理） |
+| `AuthenticationError` | 401 | ❌ 500（被 `except Exception` 吞没） |
+| `RateLimitError` | 429 | ❌ 500（被 `except Exception` 吞没） |
+| `ConfigurationError` | 422 | ❌ 500（被 `except Exception` 吞没） |
+| `NetworkError` | 502 | ❌ 500（被 `except Exception` 吞没） |
+| `ExternalServiceError` | 502 | ❌ 500（被 `except Exception` 吞没） |
+
+**这种模式在多个路由中普遍存在**，例如：
+
+```python
+# api/routers/sources.py:553-577
+except HTTPException:
+    raise
+except InvalidInputError as e:
+    raise HTTPException(status_code=400, detail=str(e))
+except Exception as e:
+    logger.error(f"Error creating source: {str(e)}")
+    raise HTTPException(status_code=500, detail=f"Error creating source: {str(e)}")
+```
+
+```python
+# api/routers/search.py:51-58
+except InvalidInputError as e:
+    raise HTTPException(status_code=400, detail=str(e))
+except DatabaseOperationError as e:
+    logger.error(f"Database error during search: {str(e)}")
+    raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+except Exception as e:
+    logger.error(f"Unexpected error during search: {str(e)}")
+    raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+```
+
+#### 4.7.3 设计取舍评价
+
+**当前设计的问题**：
+
+1. **语义丢失**：客户端无法区分「API 密钥无效」（应该 401，提示用户检查配置）和「内部服务器错误」（应该 500，提示用户稍后重试或联系管理员）
+
+2. **前端处理困难**：所有错误都返回 500，前端无法根据状态码提供不同的用户体验（例如：401 应该跳转到配置页面，429 应该显示倒计时重试）
+
+3. **全局异常处理器形同虚设**：`api/main.py` 中精心设计的异常到状态码映射，在实际运行中几乎不会被触发，因为路由层已经把所有异常都转为 `HTTPException(500)`
+
+**设计取舍的可能原因**：
+
+1. **简化错误处理**：路由层使用统一的 `except Exception` 模式，代码编写简单，不需要考虑各种异常类型
+
+2. **历史遗留**：可能早期版本没有全局异常处理器，路由层的错误处理模式是那个时期遗留下来的
+
+3. **日志记录需求**：路由层的 `except Exception` 块通常包含详细的日志记录（如 `traceback.format_exc()`），开发者可能担心移除这些块会丢失日志信息
+
+**改进建议**：
+
+如果要修复这个问题，可以采用以下策略之一：
+
+**策略 A：移除路由层的通用异常捕获，依赖全局处理器**
+
+```python
+# 改进后的模式
+@router.post("/chat/execute", response_model=ExecuteChatResponse)
+async def execute_chat(request: ExecuteChatRequest):
+    try:
+        # ... 业务逻辑 ...
+        return ExecuteChatResponse(...)
+    except NotFoundError:
+        # 只有需要特殊处理的异常才在这里捕获
+        raise HTTPException(status_code=404, detail="Session not found")
+    # 移除 except Exception 块！
+    # 让其他异常（AuthenticationError、RateLimitError 等）
+    # 向上传播到全局异常处理器
+```
+
+**策略 B：在路由层显式转换已知异常类型**
+
+```python
+# 改进后的模式
+@router.post("/chat/execute", response_model=ExecuteChatResponse)
+async def execute_chat(request: ExecuteChatRequest):
+    try:
+        # ... 业务逻辑 ...
+        return ExecuteChatResponse(...)
+    except NotFoundError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    except AuthenticationError as e:
+        logger.error(f"Authentication error: {str(e)}")
+        raise HTTPException(status_code=401, detail=str(e))
+    except RateLimitError as e:
+        logger.error(f"Rate limit error: {str(e)}")
+        raise HTTPException(status_code=429, detail=str(e))
+    except (NetworkError, ExternalServiceError) as e:
+        logger.error(f"Service error: {str(e)}")
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        # 只有真正的未知异常才转为 500
+        logger.error(
+            f"Error executing chat: {str(e)}\n"
+            f"  Traceback:\n{traceback.format_exc()}"
+        )
+        raise HTTPException(status_code=500, detail=f"Error executing chat: {str(e)}")
+```
+
+**策略 C：使用中间件或依赖项记录日志**
+
+将日志记录逻辑移到中间件或依赖项中，路由层不再需要 `except Exception` 块来记录日志，从而可以移除这些块，让异常向上传播到全局处理器。
 
 ---
 
