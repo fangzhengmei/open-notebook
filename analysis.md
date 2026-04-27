@@ -859,24 +859,65 @@ async def hybrid_search_with_graph(
             query_embedding = await generate_embedding(keyword)
             
             # 对候选执行向量相似度计算
-            # 注意：这里只在候选范围内搜索
+            # 注意：SurrealDB 不支持 UNION ALL，使用多条语句 + array::union()
+            # 参考现有 fn::vector_search 的实现风格
             secondary_results = await repo_query("""
-                SELECT 
+                -- 查询 source_embedding 中的候选
+                let $source_embedding_results = SELECT 
                     id,
-                    parent_id,
-                    title,
+                    source.id as parent_id,
+                    source.title as title,
+                    content,
                     vector::similarity::cosine(embedding, $query_embedding) as similarity
-                FROM (
-                    SELECT * FROM source_embedding WHERE source IN $candidate_ids
-                    UNION ALL
-                    SELECT * FROM source_insight WHERE source IN $candidate_ids
-                    UNION ALL
-                    SELECT * FROM note WHERE id IN $candidate_ids
-                )
-                WHERE embedding != NONE
-                  AND vector::similarity::cosine(embedding, $query_embedding) >= $min_score
-                ORDER BY similarity DESC
-                LIMIT $limit
+                FROM source_embedding 
+                WHERE source IN $candidate_ids
+                  AND embedding != NONE
+                  AND array::len(embedding) = array::len($query_embedding)
+                  AND vector::similarity::cosine(embedding, $query_embedding) >= $min_score;
+                
+                -- 查询 source_insight 中的候选
+                let $source_insight_results = SELECT 
+                    id,
+                    source.id as parent_id,
+                    insight_type + ' - ' + (source.title OR '') as title,
+                    content,
+                    vector::similarity::cosine(embedding, $query_embedding) as similarity
+                FROM source_insight 
+                WHERE source IN $candidate_ids
+                  AND embedding != NONE
+                  AND array::len(embedding) = array::len($query_embedding)
+                  AND vector::similarity::cosine(embedding, $query_embedding) >= $min_score;
+                
+                -- 查询 note 中的候选
+                let $note_results = SELECT 
+                    id,
+                    id as parent_id,
+                    title,
+                    content,
+                    vector::similarity::cosine(embedding, $query_embedding) as similarity
+                FROM note 
+                WHERE id IN $candidate_ids
+                  AND embedding != NONE
+                  AND array::len(embedding) = array::len($query_embedding)
+                  AND vector::similarity::cosine(embedding, $query_embedding) >= $min_score;
+                
+                -- 合并所有结果（参考 fn::vector_search 的 array::union 用法）
+                let $all_results = array::union(
+                    array::union($source_embedding_results, $source_insight_results),
+                    $note_results
+                );
+                
+                -- 去重排序并返回
+                RETURN (
+                    SELECT id, parent_id, title, content, 
+                           math::max(similarity) as similarity,
+                           array::flatten(content) as matches
+                    FROM $all_results
+                    WHERE id IS NOT NONE
+                    GROUP BY id, parent_id, title
+                    ORDER BY similarity DESC
+                    LIMIT $limit
+                );
             """, {
                 "query_embedding": query_embedding,
                 "candidate_ids": candidate_ids,
@@ -885,35 +926,76 @@ async def hybrid_search_with_graph(
             })
             
             # 处理 secondary_results，添加元数据
-            for r in secondary_results:
-                r["_source_type"] = "validated_expansion"
-                r["_hop_count"] = 1
-                r["_original_score"] = r["similarity"]
-                # 应用衰减
-                r["similarity"] = r["similarity"] * graph_config.decay_factor
-                validated_results.append(r)
+            # 注意：repo_query 返回的是多条语句的结果列表，取最后一条（RETURN 语句的结果）
+            if secondary_results and isinstance(secondary_results, list):
+                # SurrealDB 的 query() 返回每条语句的结果列表
+                # 我们只关心最后一条 RETURN 语句的结果
+                final_results = secondary_results[-1] if len(secondary_results) > 0 else []
+                if isinstance(final_results, list):
+                    for r in final_results:
+                        r["_source_type"] = "validated_expansion"
+                        r["_hop_count"] = 1
+                        r["_original_score"] = r.get("similarity", 0)
+                        # 应用衰减
+                        if "similarity" in r:
+                            r["similarity"] = r["similarity"] * graph_config.decay_factor
+                        validated_results.append(r)
                 
         else:
             # 全文检索：对候选执行关键词匹配
+            # 参考现有 fn::text_search 的实现风格
             secondary_results = await repo_query("""
-                SELECT 
+                -- 查询 source 标题匹配
+                let $source_title_results = SELECT 
                     id,
-                    parent_id,
+                    id as parent_id,
                     title,
+                    search::highlight('`', '`', 1) as content,
                     math::max(search::score(1)) as relevance
-                FROM (
-                    SELECT id, parent_id, title FROM source WHERE id IN $candidate_ids AND title @1@ $keyword
-                    UNION ALL
-                    SELECT source.id as id, source.id as parent_id, source.title as title 
-                    FROM source_embedding WHERE source IN $candidate_ids AND content @1@ $keyword
-                    UNION ALL
-                    SELECT id, id as parent_id, title FROM note WHERE id IN $candidate_ids 
-                    AND (title @1@ $keyword OR content @1@ $keyword)
-                )
-                GROUP BY id, parent_id, title
-                HAVING relevance >= $min_score
-                ORDER BY relevance DESC
-                LIMIT $limit
+                FROM source 
+                WHERE id IN $candidate_ids
+                  AND title @1@ $keyword
+                GROUP BY id;
+                
+                -- 查询 source_embedding 内容匹配
+                let $source_embedding_results = SELECT 
+                    source.id as id,
+                    source.id as parent_id,
+                    source.title as title,
+                    search::highlight('`', '`', 1) as content,
+                    math::max(search::score(1)) as relevance
+                FROM source_embedding 
+                WHERE source IN $candidate_ids
+                  AND content @1@ $keyword
+                GROUP BY id;
+                
+                -- 查询 note 标题/内容匹配
+                let $note_results = SELECT 
+                    id,
+                    id as parent_id,
+                    title,
+                    search::highlight('`', '`', 1) as content,
+                    math::max(search::score(1)) as relevance
+                FROM note 
+                WHERE id IN $candidate_ids
+                  AND (title @1@ $keyword OR content @1@ $keyword)
+                GROUP BY id;
+                
+                -- 合并结果（参考 fn::text_search 的合并方式）
+                let $source_results = array::union($source_title_results, $source_embedding_results);
+                let $all_results = array::union($source_results, $note_results);
+                
+                -- 去重排序并返回
+                RETURN (
+                    SELECT id, parent_id, title, content, 
+                           math::max(relevance) as relevance
+                    FROM $all_results
+                    WHERE id IS NOT NONE
+                    GROUP BY id, parent_id, title
+                    HAVING relevance >= $min_score
+                    ORDER BY relevance DESC
+                    LIMIT $limit
+                );
             """, {
                 "keyword": keyword,
                 "candidate_ids": candidate_ids,
@@ -922,13 +1004,17 @@ async def hybrid_search_with_graph(
             })
             
             # 处理 secondary_results
-            for r in secondary_results:
-                r["_source_type"] = "validated_expansion"
-                r["_hop_count"] = 1
-                r["_original_score"] = r["relevance"]
-                # 应用衰减
-                r["relevance"] = r["relevance"] * graph_config.decay_factor
-                validated_results.append(r)
+            if secondary_results and isinstance(secondary_results, list):
+                final_results = secondary_results[-1] if len(secondary_results) > 0 else []
+                if isinstance(final_results, list):
+                    for r in final_results:
+                        r["_source_type"] = "validated_expansion"
+                        r["_hop_count"] = 1
+                        r["_original_score"] = r.get("relevance", 0)
+                        # 应用衰减
+                        if "relevance" in r:
+                            r["relevance"] = r["relevance"] * graph_config.decay_factor
+                        validated_results.append(r)
     
     logger.info(f"[hybrid_search] 二次验证通过: {len(validated_results)} 个结果")
     
