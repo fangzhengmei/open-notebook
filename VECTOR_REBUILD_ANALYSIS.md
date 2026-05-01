@@ -770,7 +770,575 @@ else:
 
 ---
 
-## 8. 关键代码位置汇总
+## 8. 状态查询与进度追踪
+
+### 8.1 前端轮询机制
+
+**位置**: `frontend/src/app/(dashboard)/advanced/components/RebuildEmbeddings.tsx`
+
+#### 8.1.1 轮询触发与停止
+
+```typescript
+// 启动轮询
+const startPolling = (cmdId: string) => {
+  const interval = setInterval(async () => {
+    const statusData = await embeddingApi.getRebuildStatus(cmdId)
+    setStatus(statusData)
+
+    // 任务完成或失败时停止轮询
+    if (statusData.status === 'completed' || statusData.status === 'failed') {
+      stopPolling()
+    }
+  }, 5000)  // 每 5 秒轮询一次
+
+  setPollingInterval(interval)
+}
+
+// 停止轮询
+const stopPolling = useCallback(() => {
+  if (pollingInterval) {
+    clearInterval(pollingInterval)
+    setPollingInterval(null)
+  }
+}, [pollingInterval])
+```
+
+#### 8.1.2 轮询配置
+
+| 配置项 | 值 | 说明 |
+|-------|---|------|
+| 轮询间隔 | 5000ms (5秒) | 状态查询频率 |
+| 停止条件 | `status === 'completed'` 或 `status === 'failed'` | 任务结束后停止 |
+| 组件卸载 | `useEffect` cleanup | 防止内存泄漏 |
+
+### 8.2 API 状态查询接口
+
+**位置**: `api/routers/embedding_rebuild.py:123-192`
+
+#### 8.2.1 接口定义
+
+```python
+@router.get("/rebuild/{command_id}/status", response_model=RebuildStatusResponse)
+async def get_rebuild_status(command_id: str):
+    """
+    Get the status of a rebuild operation.
+    
+    Returns:
+    - **status**: queued, running, completed, failed
+    - **progress**: processed count, total count, percentage
+    - **stats**: breakdown by type (sources, notes, insights, failed)
+    - **timestamps**: started_at, completed_at
+    """
+```
+
+#### 8.2.2 状态数据结构
+
+```python
+# api/models.py:248-256
+class RebuildStatusResponse(BaseModel):
+    command_id: str                    # 命令 ID
+    status: str                        # 状态: queued, running, completed, failed
+    progress: Optional[RebuildProgress] = None  # 进度信息
+    stats: Optional[RebuildStats] = None        # 统计信息
+    started_at: Optional[str] = None   # 开始时间
+    completed_at: Optional[str] = None # 完成时间
+    error_message: Optional[str] = None # 错误信息
+
+class RebuildProgress(BaseModel):
+    processed: int       # 已处理数
+    total: int           # 总数
+    percentage: float    # 百分比
+
+class RebuildStats(BaseModel):
+    sources: int = 0     # Sources 数
+    notes: int = 0       # Notes 数
+    insights: int = 0    # Insights 数
+    failed: int = 0      # 失败数
+```
+
+#### 8.2.3 状态查询流程
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        状态查询完整流程                                    │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  前端 (每 5 秒轮询)                                                      │
+│       │                                                                 │
+│       ▼                                                                 │
+│  GET /embeddings/rebuild/{command_id}/status                           │
+│       │                                                                 │
+│       ▼                                                                 │
+│  api/routers/embedding_rebuild.py:get_rebuild_status()                 │
+│       │                                                                 │
+│       ├── 1. 调用 surreal_commands.get_command_status(command_id)       │
+│       │         │                                                        │
+│       │         ▼                                                        │
+│       │    从 SurrealDB 的 command 表查询记录                            │
+│       │    返回: status, result, created, updated, error_message        │
+│       │                                                                 │
+│       ├── 2. 构建响应对象                                                │
+│       │    ├── response.status = status.status                          │
+│       │    ├── response.progress = 从 result 提取                       │
+│       │    ├── response.stats = 从 result 提取                          │
+│       │    ├── response.started_at = status.created                     │
+│       │    ├── response.completed_at = status.updated                   │
+│       │    └── response.error_message = result.error_message (if failed)│
+│       │                                                                 │
+│       └── 3. 返回 RebuildStatusResponse                                  │
+│                                                                         │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.3 父任务与子任务的状态关系
+
+#### 8.3.1 任务层级结构
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        任务层级结构                                    │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  父任务: rebuild_embeddings (command_id = "parent_123")             │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │  status: queued → running → completed/failed                  │  │
+│  │  result: {                                                     │  │
+│  │    total_items: 100,                                           │  │
+│  │    jobs_submitted: 100,    ← 已提交的子任务数                  │  │
+│  │    failed_submissions: 0,   ← 提交失败的数量                   │  │
+│  │    sources_submitted: 50,                                       │  │
+│  │    notes_submitted: 30,                                         │  │
+│  │    insights_submitted: 20                                       │  │
+│  │  }                                                              │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                              │                                        │
+│                              ▼                                        │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │  子任务 (独立的 command_id)                                    │  │
+│  │                                                               │  │
+│  │  embed_source:1  │ embed_source:2  │ ... │ embed_source:50   │  │
+│  │  embed_note:1    │ embed_note:2    │ ... │ embed_note:30     │  │
+│  │  embed_insight:1 │ embed_insight:2 │ ... │ embed_insight:20  │  │
+│  │                                                               │  │
+│  │  每个子任务都有自己的:                                          │  │
+│  │  ├── status: queued/running/completed/failed                 │  │
+│  │  ├── result: {success, error_message, processing_time, ...} │  │
+│  │  └── created/updated 时间戳                                   │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ⚠️ 重要: 父任务不追踪子任务的执行状态!                               │
+│     - 父任务 completed ≠ 所有子任务 completed                        │
+│     - 子任务的失败信息不会自动汇总到父任务                            │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 8.3.2 父任务的状态流转
+
+**位置**: `commands/embedding_commands.py:622-787`
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                 rebuild_embeddings 父任务状态流转                      │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  初始状态: queued                                                    │
+│       │                                                              │
+│       ▼ (调度器拾取任务)                                              │
+│  running                                                             │
+│       │                                                              │
+│       ├── 1. 检查嵌入模型配置                                        │
+│       ├── 2. collect_items_for_rebuild()                            │
+│       ├── 3. 遍历所有 ID，提交子命令                                   │
+│       │    ├── submit_command("embed_source")                       │
+│       │    ├── submit_command("embed_note")                         │
+│       │    └── submit_command("embed_insight")                      │
+│       │                                                              │
+│       ├── 4. 统计提交结果                                            │
+│       │    ├── jobs_submitted: 成功提交的数量                        │
+│       │    └── failed_submissions: 提交失败的数量                     │
+│       │                                                              │
+│       └── 5. 返回 RebuildEmbeddingsOutput                           │
+│            (此时父任务状态变为 completed)                              │
+│                                                                      │
+│       ▼                                                              │
+│  completed / failed                                                  │
+│                                                                      │
+│  注意: 父任务 completed 只表示"所有子任务都已提交"，                   │
+│       不表示"所有子任务都已执行完成"!                                 │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 8.3.3 进度计算逻辑
+
+**位置**: `api/routers/embedding_rebuild.py:151-159`
+
+```python
+# 从父任务的 result 中提取进度信息
+if "total_items" in result and "jobs_submitted" in result:
+    total = result["total_items"]
+    submitted = result["jobs_submitted"]
+    response.progress = RebuildProgress(
+        processed=submitted,      # 已提交的任务数
+        total=total,              # 总任务数
+        percentage=round((submitted / total * 100) if total > 0 else 0, 2),
+    )
+```
+
+**关键发现**:
+
+| 进度字段 | 实际含义 | 潜在问题 |
+|---------|---------|---------|
+| `processed` | `jobs_submitted` (已提交的任务数) | 不是已完成的任务数 |
+| `percentage` | `jobs_submitted / total_items * 100` | 可能误导用户 |
+
+**示例场景**:
+- 父任务提交了 100 个子任务
+- 父任务状态变为 `completed`，进度显示 100%
+- 但实际上可能只有 10 个子任务真正执行完成
+- 用户看到进度 100% 以为全部完成，但实际还有 90 个子任务在执行中
+
+### 8.4 子任务的独立状态追踪
+
+#### 8.4.1 子任务状态管理
+
+**位置**: `open_notebook/domain/notebook.py:318-359`
+
+Source 对象可以追踪与其关联的命令状态:
+
+```python
+# 获取状态
+async def get_status(self) -> Optional[str]:
+    if not self.command:
+        return None
+    try:
+        from surreal_commands import get_command_status
+        status = await get_command_status(str(self.command))
+        return status.status if status else "unknown"
+    except Exception as e:
+        logger.warning(f"Failed to get command status for {self.command}: {e}")
+        return "unknown"
+
+# 获取详细进度
+async def get_processing_progress(self) -> Optional[Dict[str, Any]]:
+    if not self.command:
+        return None
+    try:
+        from surreal_commands import get_command_status
+        status_result = await get_command_status(str(self.command))
+        if not status_result:
+            return None
+        
+        result = getattr(status_result, "result", None)
+        return {
+            "status": status_result.status,
+            "started_at": execution_metadata.get("started_at"),
+            "completed_at": execution_metadata.get("completed_at"),
+            "error": getattr(status_result, "error_message", None),
+            "result": result,
+        }
+    except Exception as e:
+        logger.warning(f"Failed to get command progress for {self.command}: {e}")
+        return None
+```
+
+#### 8.4.2 子任务与父任务的关联问题
+
+| 问题 | 说明 |
+|-----|------|
+| **没有关联** | 父任务不知道自己提交了哪些子任务的 command_id |
+| **无法追踪** | 无法通过父任务查询所有子任务的状态 |
+| **没有汇总** | 子任务的成功/失败不会影响父任务的状态 |
+| **进度不准确** | 父任务的进度基于"已提交"而非"已完成" |
+
+### 8.5 失败信息的收集与展示
+
+#### 8.5.1 错误层级分类
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        错误层级分类                                       │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  层级 1: 父任务级别错误 (fatal)                                          │
+│  ┌──────────────────────────────────────────────────────────────────┐ │
+│  │  触发位置: rebuild_embeddings_command                               │ │
+│  │  错误类型:                                                          │ │
+│  │  ├── 嵌入模型未配置                                                  │ │
+│  │  ├── 数据库查询失败 (收集项目时)                                      │ │
+│  │  └── 其他系统级错误                                                  │ │
+│  │                                                                     │ │
+│  │  结果: 父任务 status = "failed"                                      │ │
+│  │       error_message 包含具体错误信息                                  │ │
+│  │       不会提交任何子任务                                              │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
+│                                                                         │
+│  层级 2: 子任务提交失败 (submission error)                              │
+│  ┌──────────────────────────────────────────────────────────────────┐ │
+│  │  触发位置: rebuild_embeddings_command 中的 submit_command() 调用    │ │
+│  │  错误类型:                                                          │ │
+│  │  ├── surreal_commands 注册问题                                      │ │
+│  │  ├── 数据库写入失败                                                  │ │
+│  │  └── 其他提交时异常                                                  │ │
+│  │                                                                     │ │
+│  │  结果: 统计到 failed_submissions                                     │ │
+│  │       父任务继续执行，提交其他子任务                                   │ │
+│  │       父任务最终 status 仍为 "completed"                             │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
+│                                                                         │
+│  层级 3: 子任务执行失败 (execution error)                               │
+│  ┌──────────────────────────────────────────────────────────────────┐ │
+│  │  触发位置: embed_source/note/insight_command 执行过程中              │ │
+│  │  错误类型:                                                          │ │
+│  │  ├── 永久错误 (ValueError, ConfigurationError)                      │ │
+│  │  │   ├── 记录不存在                                                  │ │
+│  │  │   ├── 内容为空                                                    │ │
+│  │  │   └── 配置错误                                                    │ │
+│  │  │   结果: 立即返回 success=False + error_message                    │ │
+│  │  │         不重试                                                    │ │
+│  │  │                                                                   │ │
+│  │  └── 瞬时错误 (其他 Exception)                                       │ │
+│  │      ├── 网络超时                                                    │ │
+│  │      ├── API 限流                                                    │ │
+│  │      └── 数据库冲突                                                  │ │
+│  │      结果: 由 surreal-commands 重试最多 5 次                         │ │
+│  │            最终失败后记录到 command 表                                │ │
+│  │                                                                     │ │
+│  │  ⚠️ 关键: 这些失败信息**不会**自动汇总到父任务!                       │ │
+│  │     父任务不知道子任务是否执行成功                                    │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
+│                                                                         │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 8.5.2 父任务级错误处理
+
+**位置**: `commands/embedding_commands.py:775-787`
+
+```python
+except Exception as e:
+    processing_time = time.time() - start_time
+    logger.error(f"Rebuild embeddings failed: {e}")
+    logger.exception(e)
+    
+    return RebuildEmbeddingsOutput(
+        success=False,
+        total_items=0,
+        jobs_submitted=0,
+        failed_submissions=0,
+        processing_time=processing_time,
+        error_message=str(e),  # 错误信息会存储到 result 中
+    )
+```
+
+#### 8.5.3 子任务级错误处理 (永久错误)
+
+**位置**: `commands/embedding_commands.py:190-202` (以 embed_note 为例)
+
+```python
+except ValueError as e:
+    # 永久失败 - 不重试
+    processing_time = time.time() - start_time
+    cmd_id = get_command_id(input_data)
+    logger.error(
+        f"Failed to embed note {input_data.note_id} (command: {cmd_id}): {e}"
+    )
+    return EmbedNoteOutput(
+        success=False,
+        note_id=input_data.note_id,
+        processing_time=processing_time,
+        error_message=str(e),  # 错误信息存储到子任务的 result 中
+    )
+```
+
+#### 8.5.4 子任务级错误处理 (瞬时错误)
+
+**位置**: `commands/embedding_commands.py:203-210`
+
+```python
+except Exception as e:
+    # 瞬时失败 - 会被重试 (surreal-commands 记录最终失败)
+    cmd_id = get_command_id(input_data)
+    logger.debug(
+        f"Transient error embedding note {input_data.note_id} "
+        f"(command: {cmd_id}): {e}"
+    )
+    raise  # 抛出异常让 surreal-commands 处理重试
+```
+
+### 8.6 前端展示的状态与错误信号
+
+#### 8.6.1 状态图标与颜色
+
+**位置**: `frontend/src/app/(dashboard)/advanced/components/RebuildEmbeddings.tsx:229-232`
+
+```typescript
+{status.status === 'queued' && <Clock className="h-5 w-5 text-yellow-500" />}
+{status.status === 'running' && <Loader2 className="h-5 w-5 text-blue-500 animate-spin" />}
+{status.status === 'completed' && <CheckCircle2 className="h-5 w-5 text-green-500" />}
+{status.status === 'failed' && <XCircle className="h-5 w-5 text-red-500" />}
+```
+
+#### 8.6.2 状态展示汇总
+
+| 状态 | 图标 | 颜色 | 说明 |
+|-----|------|------|------|
+| `queued` | Clock | 黄色 | 任务已排队，等待执行 |
+| `running` | Loader2 (旋转) | 蓝色 | 任务正在执行中 |
+| `completed` | CheckCircle2 | 绿色 | 父任务已完成 (子任务可能还在执行) |
+| `failed` | XCircle | 红色 | 父任务执行失败 |
+
+#### 8.6.3 进度条展示
+
+**位置**: `frontend/src/app/(dashboard)/advanced/components/RebuildEmbeddings.tsx:254-271`
+
+```typescript
+{progressData && (
+  <div className="space-y-2">
+    <div className="flex justify-between text-sm">
+      <span>{t('common.progress')}</span>
+      <span className="font-medium">
+        {t('advanced.rebuild.itemsProcessed')
+          .replace('{processed}', processedItems.toString())
+          .replace('{total}', totalItems.toString())
+          .replace('{percent}', progressPercent.toFixed(1))}
+      </span>
+    </div>
+    <Progress value={progressPercent} className="h-2" />
+    {failedItems > 0 && (
+      <p className="text-sm text-yellow-600">
+        ⚠️ {t('advanced.rebuild.failedItems').replace('{count}', failedItems.toString())}
+      </p>
+    )}
+  </div>
+)}
+```
+
+#### 8.6.4 统计面板
+
+**位置**: `frontend/src/app/(dashboard)/advanced/components/RebuildEmbeddings.tsx:274-295`
+
+```typescript
+{stats && (
+  <div className="grid grid-cols-4 gap-4">
+    <div className="space-y-1">
+      <p className="text-sm text-muted-foreground">{t('navigation.sources')}</p>
+      <p className="text-2xl font-bold">{sourcesProcessed}</p>
+    </div>
+    <div className="space-y-1">
+      <p className="text-sm text-muted-foreground">{t('common.notes')}</p>
+      <p className="text-2xl font-bold">{notesProcessed}</p>
+    </div>
+    <div className="space-y-1">
+      <p className="text-sm text-muted-foreground">{t('common.insights')}</p>
+      <p className="text-2xl font-bold">{insightsProcessed}</p>
+    </div>
+    <div className="space-y-1">
+      <p className="text-sm text-muted-foreground">{t('advanced.rebuild.time')}</p>
+      <p className="text-2xl font-bold">
+        {processingTimeSeconds !== undefined ? `${processingTimeSeconds.toFixed(1)}s` : '—'}
+      </p>
+    </div>
+  </div>
+)}
+```
+
+#### 8.6.5 错误信息展示
+
+**位置**: `frontend/src/app/(dashboard)/advanced/components/RebuildEmbeddings.tsx:297-302`
+
+```typescript
+{status.error_message && (
+  <Alert variant="destructive">
+    <AlertCircle className="h-4 w-4" />
+    <AlertDescription>{status.error_message}</AlertDescription>
+  </Alert>
+)}
+```
+
+### 8.7 用户能看到的完整状态信号
+
+#### 8.7.1 信号汇总表
+
+| 信号类型 | 展示位置 | 数据来源 | 含义 |
+|---------|---------|---------|------|
+| **状态图标** | 顶部状态栏 | `status.status` | 父任务的执行状态 |
+| **状态文本** | 图标旁边 | `status.status` | queued/running/completed/failed |
+| **进度条** | 进度区域 | `jobs_submitted / total_items` | 已提交任务的比例 |
+| **进度文本** | 进度条上方 | `processed / total (percentage)` | 具体数值 |
+| **警告提示** | 进度条下方 | `failedItems > 0` | 有提交失败的任务 |
+| **统计面板** | 进度下方 | `stats` 对象 | 各类型已提交数量、耗时 |
+| **错误提示** | 统计面板下方 | `status.error_message` | 父任务级别的错误 |
+| **时间戳** | 最底部 | `started_at`, `completed_at` | 开始和完成时间 |
+
+#### 8.7.2 不同场景下的用户体验
+
+**场景 1: 父任务执行中**
+- 状态: 蓝色旋转图标 + "running"
+- 进度条: 逐渐增加 (基于已提交的任务数)
+- 用户感知: 知道任务正在进行
+
+**场景 2: 父任务完成，但子任务还在执行**
+- 状态: 绿色勾选图标 + "completed"
+- 进度条: 100%
+- ⚠️ 用户感知: 以为全部完成，但实际子任务可能还在执行
+
+**场景 3: 父任务失败**
+- 状态: 红色叉号图标 + "failed"
+- 错误信息: 显示 `error_message`
+- 用户感知: 知道任务失败，可以看到具体原因
+
+**场景 4: 有提交失败的任务**
+- 状态: 绿色勾选 (父任务成功)
+- 警告提示: 黄色 "⚠️ X 个项目失败"
+- 用户感知: 知道部分任务提交失败，但不知道具体是哪些
+
+### 8.8 当前设计的局限性
+
+#### 8.8.1 问题清单
+
+| 问题 | 影响 | 严重程度 |
+|-----|------|---------|
+| 进度基于"已提交"而非"已完成" | 用户可能在子任务还在执行时就以为完成了 | 高 |
+| 父任务不追踪子任务状态 | 无法知道有多少子任务实际成功/失败 | 高 |
+| 子任务错误不汇总 | 子任务执行失败用户看不到 | 高 |
+| `failed_submissions` 含义模糊 | 用户以为是执行失败，实际是提交失败 | 中 |
+| 没有重试状态展示 | 用户不知道哪些任务在重试 | 低 |
+
+#### 8.8.2 潜在的改进方向
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        潜在改进方向                                       │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  1. 父任务追踪子任务                                                     │
+│     ├── 存储所有子任务的 command_id 列表                                │
+│     ├── 轮询时查询所有子任务的状态                                       │
+│     └── 计算真正的完成进度 (已完成子任务数 / 总子任务数)                 │
+│                                                                         │
+│  2. 子任务状态汇总                                                       │
+│     ├── 统计各状态的子任务数量 (queued/running/completed/failed)        │
+│     ├── 汇总所有子任务的错误信息                                         │
+│     └── 展示给用户真正的执行状态                                         │
+│                                                                         │
+│  3. 进度计算改进                                                         │
+│     ├── 区分"提交进度"和"执行进度"                                      │
+│     ├── 或者只展示"执行进度"                                             │
+│     └── 添加更详细的进度信息                                             │
+│                                                                         │
+│  4. 错误信息改进                                                         │
+│     ├── 区分"提交失败"和"执行失败"                                      │
+│     ├── 展示失败的具体子任务 ID 和类型                                   │
+│     └── 提供重试按钮让用户可以重试失败的任务                              │
+│                                                                         │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 9. 关键代码位置汇总
 
 ### 8.1 按功能模块分类
 
