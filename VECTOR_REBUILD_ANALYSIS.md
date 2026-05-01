@@ -1336,6 +1336,492 @@ except Exception as e:
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
+### 8.9 漏点分析: 启动阶段预估总量与实际重建收集总量的口径差异
+
+#### 8.9.1 问题概述
+
+向量重建流程存在**两个阶段的总量统计**，但两者的**查询口径不一致**，导致用户看到的预估总量与实际处理数量存在差异。
+
+| 阶段 | 触发时机 | 位置 | 用途 |
+|-----|---------|------|------|
+| **启动阶段预估** | 用户点击"开始重建"时 | `api/routers/embedding_rebuild.py:start_rebuild` | 立即返回给用户的预估数量 |
+| **实际重建收集** | 父任务 `rebuild_embeddings_command` 执行时 | `commands/embedding_commands.py:collect_items_for_rebuild` | 实际提交子任务的数量 |
+
+#### 8.9.2 代码级对比分析
+
+##### Source 统计对比
+
+**启动阶段 (`embedding_rebuild.py:40-61`)**:
+
+```python
+if request.include_sources:
+    if request.mode == "existing":
+        # 从 source_embedding 表统计有有效 embedding 的 Source
+        result = await repo_query(
+            """
+            SELECT VALUE count(array::distinct(
+                SELECT VALUE source.id
+                FROM source_embedding
+                WHERE embedding != none AND array::len(embedding) > 0
+            )) as count FROM {}
+            """
+        )
+    else:  # mode == "all"
+        # ⚠️ 只检查 full_text != none
+        result = await repo_query(
+            "SELECT VALUE count() as count FROM source WHERE full_text != none GROUP ALL"
+        )
+```
+
+**实际重建阶段 (`embedding_commands.py:563-587`)**:
+
+```python
+if include_sources:
+    if mode == "existing":
+        # 与启动阶段一致
+        result = await repo_query(
+            """
+            RETURN array::distinct(
+                SELECT VALUE source.id
+                FROM source_embedding
+                WHERE embedding != none AND array::len(embedding) > 0
+            )
+            """
+        )
+    else:  # mode == "all"
+        # ⚠️ 多了 string::trim(full_text) != '' 条件!
+        result = await repo_query(
+            "SELECT id FROM source WHERE full_text != none AND string::trim(full_text) != ''"
+        )
+```
+
+**差异分析**:
+
+| 模式 | 启动阶段 | 实际重建阶段 | 差异 |
+|-----|---------|-------------|------|
+| `existing` | `source_embedding.embedding` 非空且长度>0 | 相同 | 无差异 |
+| `all` | `source.full_text != none` | `full_text != none AND string::trim(full_text) != ''` | **实际阶段排除空字符串** |
+
+##### Note 统计对比
+
+**启动阶段 (`embedding_rebuild.py:63-76`)**:
+
+```python
+if request.include_notes:
+    if request.mode == "existing":
+        result = await repo_query(
+            "SELECT VALUE count() as count FROM note WHERE embedding != none AND array::len(embedding) > 0 GROUP ALL"
+        )
+    else:  # mode == "all"
+        # ⚠️ 只检查 content != none
+        result = await repo_query(
+            "SELECT VALUE count() as count FROM note WHERE content != none GROUP ALL"
+        )
+```
+
+**实际重建阶段 (`embedding_commands.py:589-602`)**:
+
+```python
+if include_notes:
+    if mode == "existing":
+        # 与启动阶段一致
+        result = await repo_query(
+            "SELECT id FROM note WHERE embedding != none AND array::len(embedding) > 0"
+        )
+    else:  # mode == "all"
+        # ⚠️ 多了 string::trim(content) != '' 条件!
+        result = await repo_query(
+            "SELECT id FROM note WHERE content != none AND string::trim(content) != ''"
+        )
+```
+
+**差异分析**:
+
+| 模式 | 启动阶段 | 实际重建阶段 | 差异 |
+|-----|---------|-------------|------|
+| `existing` | `note.embedding` 非空且长度>0 | 相同 | 无差异 |
+| `all` | `note.content != none` | `content != none AND string::trim(content) != ''` | **实际阶段排除空字符串** |
+
+##### Insight 统计对比 (差异最大!)
+
+**启动阶段 (`embedding_rebuild.py:78-91`)**:
+
+```python
+if request.include_insights:
+    if request.mode == "existing":
+        result = await repo_query(
+            "SELECT VALUE count() as count FROM source_insight WHERE embedding != none AND array::len(embedding) > 0 GROUP ALL"
+        )
+    else:  # mode == "all"
+        # ⚠️ 没有任何条件! 直接统计所有 source_insight 记录
+        result = await repo_query(
+            "SELECT VALUE count() as count FROM source_insight GROUP ALL"
+        )
+```
+
+**实际重建阶段 (`embedding_commands.py:604-617`)**:
+
+```python
+if include_insights:
+    if mode == "existing":
+        # 与启动阶段一致
+        result = await repo_query(
+            "SELECT id FROM source_insight WHERE embedding != none AND array::len(embedding) > 0"
+        )
+    else:  # mode == "all"
+        # ⚠️ 有条件: content != none AND string::trim(content) != ''
+        result = await repo_query(
+            "SELECT id FROM source_insight WHERE content != none AND string::trim(content) != ''"
+        )
+```
+
+**差异分析 (Critical!)**:
+
+| 模式 | 启动阶段 | 实际重建阶段 | 差异 |
+|-----|---------|-------------|------|
+| `existing` | `source_insight.embedding` 非空且长度>0 | 相同 | 无差异 |
+| `all` | **无任何条件** (`GROUP ALL`) | `content != none AND string::trim(content) != ''` | **差异极大!** |
+
+#### 8.9.3 差异汇总表
+
+| 数据类型 | 模式 | 启动阶段条件 | 实际重建阶段条件 | 差异类型 |
+|---------|------|-------------|-----------------|---------|
+| Source | `existing` | `embedding != none AND len > 0` | 相同 | 无 |
+| Source | `all` | `full_text != none` | `full_text != none AND trim(full_text) != ''` | 排除空字符串 |
+| Note | `existing` | `embedding != none AND len > 0` | 相同 | 无 |
+| Note | `all` | `content != none` | `content != none AND trim(content) != ''` | 排除空字符串 |
+| Insight | `existing` | `embedding != none AND len > 0` | 相同 | 无 |
+| Insight | `all` | **无任何条件** | `content != none AND trim(content) != ''` | **差异极大** |
+
+#### 8.9.4 用户可见影响
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                    口径差异的用户可见影响                                 │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  场景 1: 用户选择 mode="all" 开始重建                                    │
+│                                                                         │
+│  启动阶段 (用户看到):                                                    │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │  Rebuild operation started.                                       │  │
+│  │  Estimated 150 items to process.                                  │  │
+│  │  ├── Sources: 50 (full_text != none)                              │  │
+│  │  ├── Notes: 50 (content != none)                                  │  │
+│  │  └── Insights: 50 (无任何条件 - 所有记录)                          │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│  实际重建阶段 (实际处理):                                                │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │  实际只处理了 100 个项目                                           │  │
+│  │  ├── Sources: 40 (full_text 非空且非空白 - 排除了 10 个空字符串)   │  │
+│  │  ├── Notes: 40 (content 非空且非空白 - 排除了 10 个空字符串)        │  │
+│  │  └── Insights: 20 (content 非空且非空白 - 排除了 30 个无内容记录)  │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│  进度展示问题:                                                          │
+│                                                                         │
+│  进度计算: percentage = jobs_submitted / total_items * 100            │
+│                                                                         │
+│  问题 1: 分母不一致                                                      │
+│  ├── 启动阶段: total_estimate = 150 (返回给用户的 initial total_items) │
+│  └── 实际阶段: total_items = 100 (存储在父任务 result 中)              │
+│                                                                         │
+│  问题 2: 用户困惑                                                        │
+│  ├── 用户以为要处理 150 个                                              │
+│  ├── 实际只处理了 100 个                                                │
+│  └── 进度条可能显示异常 (超过 100% 或永远达不到)                         │
+│                                                                         │
+│  问题 3: Insight 差异最大                                                │
+│  ├── 启动阶段: 统计所有 source_insight 记录 (包括无 content 的)         │
+│  ├── 实际阶段: 只统计有 content 且非空白的记录                           │
+│  └── 可能导致预估与实际差异超过 50%                                      │
+│                                                                         │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 8.9.5 根本原因分析
+
+| 问题 | 根本原因 |
+|-----|---------|
+| **重复代码** | 两个阶段有几乎相同的查询逻辑，但写在不同文件中 |
+| **无统一常量** | 没有定义统一的查询条件常量或函数 |
+| **测试不足** | 边界情况（空字符串、null 值）没有统一处理 |
+| **Insight 特殊问题** | 启动阶段 `mode="all"` 时忘记加 `content != none` 条件 |
+
+### 8.10 漏点分析: 子任务 command_id 的保存与丢失点
+
+#### 8.10.1 问题概述
+
+父任务 `rebuild_embeddings_command` 作为协调器，提交了大量子任务（`embed_source`, `embed_note`, `embed_insight`），但**没有保存这些子任务的 command_id**，导致：
+
+1. 无法追踪子任务的执行状态
+2. 无法汇总子任务的成功/失败情况
+3. 子任务执行失败的错误信息**完全不可见**
+
+#### 8.10.2 代码级证据: command_id 的丢失点
+
+##### 提交子任务的代码 (`embedding_commands.py:690-748`)
+
+```python
+# Submit embed_source commands for sources
+logger.info(f"\nSubmitting {len(items['sources'])} source embedding jobs...")
+for idx, source_id in enumerate(items["sources"], 1):
+    try:
+        # ⚠️ submit_command() 返回 command_id，但被直接丢弃!
+        submit_command(
+            "open_notebook",
+            "embed_source",
+            {"source_id": source_id},
+        )
+        sources_submitted += 1  # 只是计数器，不保存 command_id
+
+        if idx % 50 == 0 or idx == len(items["sources"]):
+            logger.info(
+                f"  Progress: {idx}/{len(items['sources'])} source jobs submitted"
+            )
+
+    except Exception as e:
+        logger.error(f"Failed to submit embed_source for {source_id}: {e}")
+        failed_submissions += 1  # 只是计数器
+
+# Submit embed_note commands for notes (相同模式)
+for idx, note_id in enumerate(items["notes"], 1):
+    try:
+        submit_command(  # ⚠️ 返回值被丢弃
+            "open_notebook",
+            "embed_note",
+            {"note_id": note_id},
+        )
+        notes_submitted += 1
+    except Exception as e:
+        failed_submissions += 1
+
+# Submit embed_insight commands for insights (相同模式)
+for idx, insight_id in enumerate(items["insights"], 1):
+    try:
+        submit_command(  # ⚠️ 返回值被丢弃
+            "open_notebook",
+            "embed_insight",
+            {"insight_id": insight_id},
+        )
+        insights_submitted += 1
+    except Exception as e:
+        failed_submissions += 1
+```
+
+**关键问题**: `submit_command()` 函数会返回 `command_id`，但代码中**没有接收这个返回值**。
+
+##### 返回结果的数据结构 (`embedding_commands.py:764-773`)
+
+```python
+return RebuildEmbeddingsOutput(
+    success=True,
+    total_items=total_items,
+    jobs_submitted=jobs_submitted,
+    failed_submissions=failed_submissions,
+    sources_submitted=sources_submitted,  # 只是数字
+    notes_submitted=notes_submitted,      # 只是数字
+    insights_submitted=insights_submitted, # 只是数字
+    processing_time=processing_time,
+    # ⚠️ 没有任何字段保存子任务的 command_id 列表!
+)
+```
+
+#### 8.10.3 完整的丢失流程图
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                    子任务 command_id 的完整丢失流程                        │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  1. submit_command() 被调用                                             │
+│     ┌─────────────────────────────────────────────────────────────┐   │
+│     │  def submit_command(app_id, command_name, args):            │   │
+│     │      # 1. 在 SurrealDB 创建 command 记录                      │   │
+│     │      # 2. 生成唯一的 command_id                               │   │
+│     │      # 3. 返回 command_id                                    │   │
+│     │      return command_id  # ⚠️ 这个值被丢弃!                  │   │
+│     └─────────────────────────────────────────────────────────────┘   │
+│                              │                                          │
+│                              ▼                                          │
+│  2. 调用处没有接收返回值                                                  │
+│     ┌─────────────────────────────────────────────────────────────┐   │
+│     │  for source_id in items["sources"]:                          │   │
+│     │      try:                                                     │   │
+│     │          submit_command(      # ⚠️ 没有赋值!                │   │
+│     │              "open_notebook",                                 │   │
+│     │              "embed_source",                                  │   │
+│     │              {"source_id": source_id},                        │   │
+│     │          )                                                    │   │
+│     │          sources_submitted += 1  # 只是计数器                 │   │
+│     │      except Exception as e:                                   │   │
+│     │          failed_submissions += 1  # 只是计数器                │   │
+│     └─────────────────────────────────────────────────────────────┘   │
+│                              │                                          │
+│                              ▼                                          │
+│  3. command_id 永远丢失                                                  │
+│     ┌─────────────────────────────────────────────────────────────┐   │
+│     │  ┌─────────────┐      ┌─────────────┐                        │   │
+│     │  │ command_id  │ ───▶ │  内存临时   │ ───▶ │  完全丢失! │   │
+│     │  │ (返回值)    │      │  变量(无)   │      │             │   │
+│     │  └─────────────┘      └─────────────┘                        │   │
+│     │                                                                 │   │
+│     │  只有计数器被保存:                                              │   │
+│     │  ├── sources_submitted: 50 (数字)                              │   │
+│     │  ├── notes_submitted: 30 (数字)                                │   │
+│     │  └── insights_submitted: 20 (数字)                             │   │
+│     │                                                                 │   │
+│     │  没有任何地方保存:                                               │   │
+│     │  ├── sub_commands: ["embed_source:abc123", "embed_note:def456", ...]│   │
+│     │  ├── failed_command_ids: [...]                                  │   │
+│     │  └── 任何 command_id 相关的数据                                  │   │
+│     └─────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 8.10.4 导致失败不可观测的原因分析
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                    失败不可观测的完整链路                                 │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  假设场景: 100 个子任务被提交，其中 5 个执行失败                          │
+│                                                                         │
+│  子任务执行流程:                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │  子任务 1: embed_source (command_id: "abc123")                   │  │
+│  │  └── 执行成功: result = {"success": true, ...}                   │  │
+│  │                                                                   │  │
+│  │  子任务 2: embed_source (command_id: "def456")                   │  │
+│  │  └── 执行失败: result = {"success": false,                       │  │
+│  │                           "error_message": "API 限流",           │  │
+│  │                           ...}                                    │  │
+│  │                                                                   │  │
+│  │  ...                                                              │  │
+│  │                                                                   │  │
+│  │  子任务 100: embed_insight (command_id: "xyz789")                │  │
+│  │  └── 执行成功                                                     │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+│                              │                                          │
+│                              ▼                                          │
+│  父任务状态查询时的情况:                                                 │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │  父任务 status = "completed" (因为所有子任务都提交了)              │  │
+│  │                                                                   │  │
+│  │  父任务 result = {                                                 │  │
+│  │      "total_items": 100,                                          │  │
+│  │      "jobs_submitted": 100,     ← 看起来都成功了!                 │  │
+│  │      "failed_submissions": 0,    ← 0 个提交失败                   │  │
+│  │      "sources_submitted": 50,                                    │  │
+│  │      "notes_submitted": 30,                                      │  │
+│  │      "insights_submitted": 20                                    │  │
+│  │  }                                                                 │  │
+│  │                                                                   │  │
+│  │  ⚠️ 问题:                                                         │  │
+│  │  ├── 没有 sub_command_ids 字段                                    │  │
+│  │  ├── 无法查询这 100 个子任务的实际状态                             │  │
+│  │  └── 5 个执行失败的子任务**完全不可见**!                           │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+│                              │                                          │
+│                              ▼                                          │
+│  前端展示给用户的情况:                                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │  ✅ 完成 (绿色勾选)                                                │  │
+│  │                                                                   │  │
+│  │  进度: 100 / 100 (100%)                                          │  │
+│  │  ┌████████████████████████████████████████████████████████████┐  │  │
+│  │  └████████████████████████████████████████████████████████████┘  │  │
+│  │                                                                   │  │
+│  │  统计:                                                            │  │
+│  │  ├── Sources: 50                                                  │  │
+│  │  ├── Notes: 30                                                    │  │
+│  │  ├── Insights: 20                                                 │  │
+│  │  └── 失败: 0 (⚠️ 这是提交失败数，不是执行失败数!)                   │  │
+│  │                                                                   │  │
+│  │  用户感知: 所有 100 个都成功了!                                   │  │
+│  │  实际情况: 95 个成功，5 个失败 (用户完全不知道!)                  │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 8.10.5 失败类型的混淆问题
+
+| 失败类型 | 计数器字段 | 含义 | 用户可见性 |
+|---------|-----------|------|-----------|
+| **提交失败** | `failed_submissions` | 调用 `submit_command()` 时抛出异常 | ✅ 可见 (黄色警告) |
+| **执行失败** | **无任何字段** | 子任务实际执行时失败 | ❌ **完全不可见** |
+
+**代码证据** (`embedding_commands.py:706-708`):
+
+```python
+except Exception as e:
+    logger.error(f"Failed to submit embed_source for {source_id}: {e}")
+    failed_submissions += 1  # 只统计提交失败
+```
+
+这里的 `failed_submissions` 只统计**提交时**的异常（如 `submit_command()` 本身抛出异常），不统计**执行时**的失败。
+
+#### 8.10.6 子任务独立状态追踪的限制
+
+虽然 `Source`, `Note`, `Insight` 对象有自己的状态追踪方法（见 `8.4 子任务的独立状态追踪`），但存在以下限制：
+
+| 限制 | 说明 |
+|-----|------|
+| **没有关联** | 父任务不知道子任务的 command_id 列表 |
+| **只能单个查询** | 必须知道具体的 `source_id/note_id/insight_id` 才能查询 |
+| **没有批量查询** | 无法一次性查询所有子任务的状态 |
+| **重建场景不适用** | 用户触发重建时，不知道具体哪些 ID 会被处理 |
+
+**代码证据** (`open_notebook/domain/notebook.py:318-359`):
+
+```python
+async def get_status(self) -> Optional[str]:
+    """Get the processing status of the associated command"""
+    if not self.command:  # ⚠️ 需要知道具体对象的 command 字段
+        return None
+    # ...
+```
+
+这需要先获取 `Source` 对象，然后访问其 `command` 属性，才能查询状态。但在重建场景下：
+1. 父任务不知道提交了哪些 `source_id`
+2. 即使知道，也需要逐个加载对象才能查询
+3. 没有一个统一的入口可以汇总所有子任务状态
+
+#### 8.10.7 完整的不可观测性链路总结
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                    完整的不可观测性链路                                   │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  1. 子任务 command_id 丢失                                              │
+│     ├── 位置: commands/embedding_commands.py:692-748                  │
+│     └── 原因: submit_command() 返回值未被接收                          │
+│                                                                         │
+│  2. 父任务 result 中无子任务信息                                         │
+│     ├── 位置: commands/embedding_commands.py:764-773                  │
+│     └── 原因: RebuildEmbeddingsOutput 无 command_id 列表字段           │
+│                                                                         │
+│  3. 状态查询 API 无法获取子任务                                          │
+│     ├── 位置: api/routers/embedding_rebuild.py:123-192                │
+│     └── 原因: 只能查询父任务状态，无法查询子任务                         │
+│                                                                         │
+│  4. 前端无法展示子任务失败                                               │
+│     ├── 位置: frontend/src/app/(dashboard)/advanced/components/        │
+│     │          RebuildEmbeddings.tsx                                   │
+│     └── 原因: 没有子任务状态数据来源                                    │
+│                                                                         │
+│  5. 用户被误导                                                          │
+│     ├── 看到: 绿色勾选 + 100% 进度 + 0 失败                           │
+│     └── 实际: 可能有多个子任务执行失败                                  │
+│                                                                         │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
 ---
 
 ## 9. 关键代码位置汇总
@@ -1390,7 +1876,7 @@ except Exception as e:
 | 文本搜索函数 | `open_notebook/database/migrations/4.surrealql` | `fn::text_search` |
 | 索引定义 | `open_notebook/database/migrations/10.surrealql` | `idx_source_insight_source`, `idx_source_embedding_source` |
 
-### 8.2 配置参数汇总
+### 9.2 配置参数汇总
 
 | 参数 | 位置 | 默认值 | 说明 |
 |-----|------|-------|------|
